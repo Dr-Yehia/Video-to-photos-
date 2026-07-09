@@ -25,9 +25,10 @@ import yt_dlp
 
 ProgressFn = Callable[[float, str], None]
 
-# Tried in order; None = yt-dlp's default client mix.
-_CLIENT_ATTEMPTS = (None, ["web_safari"], ["tv"], ["ios"], ["android"],
-                    ["mweb"])
+# Tried in order; None = yt-dlp's default client mix. The embedded
+# clients sometimes bypass bot checks that stop the regular ones.
+_CLIENT_ATTEMPTS = (None, ["web_safari"], ["web_embedded"], ["tv_embedded"],
+                    ["tv"], ["ios"], ["mweb"])
 
 # Failures that are specific to the requesting IP/client and therefore
 # worth retrying with another client or another network path. "drm" is
@@ -57,6 +58,13 @@ PIPED_INSTANCES: List[str] = _env_instances("V2S_PIPED_INSTANCES", [
     "https://pipedapi.kavin.rocks",
     "https://api.piped.private.coffee",
 ])
+# Cobalt — the open-source engine behind many big downloader sites.
+# Its instances fetch the video with THEIR infrastructure and hand us a
+# download tunnel; "mute" mode = video-only at the requested quality.
+COBALT_INSTANCES: List[str] = _env_instances("V2S_COBALT_INSTANCES", [
+    "https://cobalt-backend.canine.tools",
+    "https://cobalt-api.meowing.de",
+])
 
 # Live instance discovery from the official registries: public mirrors
 # die weekly, so a hardcoded list alone guarantees eventual failure.
@@ -72,7 +80,25 @@ def _discover_instances(kind: str) -> List[str]:
         return _REGISTRY_CACHE[kind]
     found: List[str] = []
     try:
-        if kind == "invidious":
+        if kind == "cobalt":
+            r = requests.get("https://instances.cobalt.best/api/instances.json",
+                             timeout=10, headers={"User-Agent": _UA})
+            r.raise_for_status()
+            entries = r.json()
+            entries = entries if isinstance(entries, list) else []
+            entries.sort(key=lambda e: -(e.get("score") or e.get("trust") or 0)
+                         if isinstance(e, dict) else 0)
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                api = str(e.get("api") or e.get("api_url") or "").rstrip("/")
+                if not api:
+                    continue
+                if not api.startswith("http"):
+                    api = "https://" + api
+                if api.startswith("https://"):
+                    found.append(api)
+        elif kind == "invidious":
             r = requests.get("https://api.invidious.io/instances.json",
                              params={"sort_by": "health"}, timeout=10,
                              headers={"User-Agent": _UA})
@@ -99,7 +125,9 @@ def _discover_instances(kind: str) -> List[str]:
 def _mirror_instances(kind: str) -> List[str]:
     """Live registry instances first (healthiest), the static list as a
     backup, de-duplicated preserving order."""
-    static = INVIDIOUS_INSTANCES if kind == "invidious" else PIPED_INSTANCES
+    static = {"invidious": INVIDIOUS_INSTANCES,
+              "piped": PIPED_INSTANCES,
+              "cobalt": COBALT_INSTANCES}[kind]
     seen, merged = set(), []
     for inst in _discover_instances(kind) + static:
         if inst not in seen:
@@ -364,6 +392,67 @@ def _piped_download(video_id: str, output_dir: str, max_height: int,
     raise last_error or RuntimeError("no Piped instance available")
 
 
+def _cobalt_stream_url(api: str, video_url: str, max_height: int,
+                       log: Optional[list]) -> Optional[str]:
+    """Ask a cobalt instance for a download tunnel: video-only ("mute")
+    at the requested quality — cobalt's own servers fetch from YouTube."""
+    q = "max" if max_height >= 4320 else str(max_height)
+    headers = {"Accept": "application/json",
+               "Content-Type": "application/json", "User-Agent": _UA}
+    try:  # current API (v10+): POST to the instance root
+        r = requests.post(f"{api}/", json={
+            "url": video_url, "videoQuality": q,
+            "downloadMode": "mute", "filenameStyle": "basic",
+        }, timeout=20, headers=headers)
+        d = r.json()
+        if d.get("status") in ("tunnel", "redirect", "stream") and d.get("url"):
+            return d["url"]
+        err = d.get("error")
+        err = err.get("code") if isinstance(err, dict) else (err or d)
+        _log(log, f"cobalt {api}: {str(err)[:120]}")
+    except Exception as exc:
+        _log(log, f"cobalt {api}: {exc}")
+    try:  # legacy API (v7): POST /api/json
+        r = requests.post(f"{api}/api/json", json={
+            "url": video_url, "vQuality": q, "isAudioMuted": True,
+        }, timeout=20, headers=headers)
+        d = r.json()
+        if d.get("status") in ("stream", "redirect", "success") and d.get("url"):
+            return d["url"]
+    except Exception:
+        pass
+    return None
+
+
+def _cobalt_download(video_url: str, output_dir: str, max_height: int,
+                     progress: Optional[ProgressFn],
+                     exact_height: bool = False,
+                     log: Optional[list] = None) -> dict:
+    last_error: Optional[Exception] = None
+    for api in _mirror_instances("cobalt"):
+        stream = _cobalt_stream_url(api, video_url, max_height, log)
+        if not stream:
+            last_error = last_error or RuntimeError("no cobalt stream")
+            continue
+        dest = os.path.join(output_dir, "video.mp4")
+        try:
+            _download_stream(stream, dest, progress)
+        except Exception as exc:
+            last_error = exc
+            _log(log, f"cobalt {api} download: {exc}")
+            continue
+        h = measure_height(dest)
+        if exact_height and h != max_height:
+            _log(log, f"cobalt {api}: gave {h}p instead of {max_height}p — "
+                      f"rejected in the strict round")
+            last_error = RuntimeError(
+                f"cobalt served {h}p, wanted {max_height}p")
+            continue
+        _log(log, f"cobalt {api}: downloaded {h}p ✓ (video-only mute)")
+        return {"path": dest, "title": "video", "duration": 0}
+    raise last_error or RuntimeError("no cobalt instance available")
+
+
 # ---------------------------------------------------------------------------
 def probe_video(url: str, cookies_file: Optional[str] = None) -> dict:
     """Read the video's metadata WITHOUT downloading it: title, duration
@@ -521,22 +610,39 @@ def download_video(
         if not _retryable(str(primary_error)):
             raise
         vid = _video_id(url)
-        if not vid:
-            raise
         if progress:
             progress(0.0, "trying mirror networks")
-        fallbacks = [_invidious_download, _piped_download]
+
+        def try_cobalt(want_exact: bool) -> dict:
+            return _cobalt_download(url, output_dir, max_height, progress,
+                                    exact_height=want_exact, log=attempt_log)
+
+        def try_invidious(want_exact: bool) -> dict:
+            return _invidious_download(vid, output_dir, max_height, progress,
+                                       exact_height=want_exact,
+                                       log=attempt_log)
+
+        def try_piped(want_exact: bool) -> dict:
+            return _piped_download(vid, output_dir, max_height, progress,
+                                   exact_height=want_exact, log=attempt_log)
+
+        mirrors = [try_invidious, try_piped]
         if source_hint == "piped":
-            fallbacks.reverse()
-        # Strict rounds on BOTH mirror networks first, then relaxed.
+            mirrors.reverse()
+        # Strict rounds on every network first, then relaxed. Cobalt
+        # verifies the exact height by measurement, so it leads the
+        # strict round; in the relaxed round the mirrors go first since
+        # they can pick the best height <= requested while cobalt gives
+        # whatever it gives.
         rounds = [True, False] if exact_height else [False]
         for want_exact in rounds:
-            for fallback in fallbacks:
+            order = [try_cobalt] + mirrors if want_exact \
+                else mirrors + [try_cobalt]
+            if not vid:  # non-YouTube-style URL: only cobalt applies
+                order = [try_cobalt]
+            for fallback in order:
                 try:
-                    return _finish(fallback(vid, output_dir, max_height,
-                                            progress,
-                                            exact_height=want_exact,
-                                            log=attempt_log))
+                    return _finish(fallback(want_exact))
                 except Exception:
                     continue
         raise primary_error

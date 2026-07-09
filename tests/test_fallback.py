@@ -95,6 +95,41 @@ class MockInvidious(BaseHTTPRequestHandler):
         pass
 
 
+class MockCobalt(BaseHTTPRequestHandler):
+    """Mimics a cobalt instance: POST / returns a tunnel URL; the tunnel
+    always serves the SAME 360p file regardless of requested quality —
+    like a real instance that lacks the wanted height."""
+    video_bytes = b""
+
+    def do_POST(self):
+        port = self.server.server_port
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        body = json.dumps({
+            "status": "tunnel",
+            "url": f"http://127.0.0.1:{port}/tunnel",
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path.startswith("/tunnel"):
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(len(self.video_bytes)))
+            self.end_headers()
+            self.wfile.write(self.video_bytes)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *a):
+        pass
+
+
 def main():
     # A false "DRM protected" report from one player client must not
     # abort the chain: it has to be retryable so other clients and the
@@ -119,12 +154,19 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_port
 
-    # Point the mirror layer at the mock; leave yt-dlp pointing at the
+    MockCobalt.video_bytes = MockInvidious.streams[18]  # always 360p
+    cobalt_server = ThreadingHTTPServer(("127.0.0.1", 0), MockCobalt)
+    threading.Thread(target=cobalt_server.serve_forever,
+                     daemon=True).start()
+    cobalt_port = cobalt_server.server_port
+
+    # Point the mirror layer at the mocks; leave yt-dlp pointing at the
     # real (unreachable) YouTube so the primary layer genuinely fails.
-    # Live registry discovery is disabled so only the mock is consulted.
+    # Live registry discovery is disabled so only the mocks are used.
     downloader.DISCOVER_INSTANCES = False
     downloader.INVIDIOUS_INSTANCES = [f"http://127.0.0.1:{port}"]
     downloader.PIPED_INSTANCES = []
+    downloader.COBALT_INSTANCES = [f"http://127.0.0.1:{cobalt_port}"]
     url = f"https://youtu.be/{VIDEO_ID}"
 
     # 1) probe reports exactly the qualities that exist
@@ -134,14 +176,23 @@ def main():
     assert probe["heights"] == [1080, 720, 360]
     assert probe["source"] == "invidious"
 
-    # 2) exact quality selection, verified by measuring the file
+    # 2) exact quality selection, verified by measuring the file.
+    # Cobalt leads the strict round but only serves 360p: for 720p it
+    # must be REJECTED by measurement and Invidious must deliver; for
+    # 360p cobalt itself may deliver.
     for want in (720, 360):
+        log = []
         info = downloader.download_video(
             url, os.path.join(tmp, f"out{want}"), max_height=want,
-            exact_height=True, source_hint=probe["source"])
+            exact_height=True, source_hint=probe["source"],
+            attempt_log=log)
         print(f"  requested {want}p -> measured {info['actual_height']}p "
               f"({os.path.getsize(info['path'])} bytes)")
         assert info["actual_height"] == want, info
+        if want == 720:
+            assert any("cobalt" in e and "rejected" in e for e in log), log
+        else:
+            assert any("cobalt" in e and "✓" in e for e in log), log
 
     # 3) graceful degradation: 1080p exists but its stream is broken —
     # the chain must fall to the NEXT height (720p), not collapse to

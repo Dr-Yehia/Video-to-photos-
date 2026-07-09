@@ -140,8 +140,9 @@ with tab_url:
         st.markdown(
             "يوتيوب يحجب التحميل من خوادم السحابة، ويطلب حرفياً تسجيل "
             "الدخول (*Sign in to confirm you're not a bot*). التطبيق يجرّب "
-            "تلقائياً 6 عملاء ثم شبكات المرايا الحية — وإذا استمر الرفض "
-            "فالحل الحاسم هو ملف `cookies.txt`:\n\n"
+            "تلقائياً عدة عملاء، ثم خدمة **Cobalt** (محرك مواقع التحميل "
+            "الكبيرة — يجلب الفيديو بدون صوت بخوادمه هو)، ثم شبكات المرايا "
+            "الحية — وإذا استمر الرفض فالحل الحاسم هو ملف `cookies.txt`:\n\n"
             "**خطوات الحصول عليه (من كمبيوتر):**\n"
             "1. ثبّت إضافة **Get cookies.txt LOCALLY** في متصفح كروم.\n"
             "2. افتح `youtube.com` وسجّل دخولك بحسابك.\n"
@@ -226,8 +227,11 @@ with tab_url:
                                      f"{chosen_height}p؟"):
                         st.code("\n".join(attempt_log) or "(فارغ)")
 
+                title = (probe.get("title")
+                         if probe.get("title") not in (None, "", "video")
+                         else info["title"])
                 result = run_pipeline(
-                    info["path"], sensitivity, workdir, info["title"])
+                    info["path"], sensitivity, workdir, title)
                 result["actual_height"] = actual
                 st.session_state["result"] = result
             except Exception as exc:
