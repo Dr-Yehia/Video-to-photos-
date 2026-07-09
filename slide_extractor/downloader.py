@@ -710,10 +710,15 @@ def download_video(
         from .pot_server import pot_server_alive
         _log(attempt_log,
              "PO-token server: " +
-             ("running ✓ (>360p unlocked)" if pot_server_alive()
+             ("running ✓" if pot_server_alive()
               else "not running — YouTube caps most channels at 360p"))
     except Exception:
         pass
+    _log(attempt_log,
+         "cookies: " + ("provided ✓" if cookies_file
+                        and os.path.isfile(cookies_file)
+                        else "NOT provided — يوتيوب يطلبها حرفياً في "
+                             "الأخطاء أدناه"))
 
     def _finish(info: dict) -> dict:
         info["actual_height"] = measure_height(info["path"])
