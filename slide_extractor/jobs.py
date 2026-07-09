@@ -16,6 +16,31 @@ from .extractor import ExtractorConfig, SlideExtractor
 from .pdf_builder import build_pdf, build_zip
 
 
+def _friendly_error(raw: str) -> str:
+    """Translate common failures into a clear, bilingual message; the raw
+    technical detail is appended for debugging."""
+    low = raw.lower()
+    if any(k in low for k in ("proxy", "403 forbidden", "unable to connect",
+                              "getaddrinfo", "timed out", "network")):
+        msg = ("تعذر الوصول إلى يوتيوب من هذا الخادم — الشبكة تحجب الموقع. "
+               "جرّب من شبكة أخرى أو ارفع ملف الفيديو مباشرة. "
+               "(Cannot reach YouTube from this server — the network blocks "
+               "it. Try another network or upload the video file directly.)")
+    elif "private video" in low or "sign in" in low:
+        msg = ("هذا الفيديو خاص أو يتطلب تسجيل دخول. "
+               "(This video is private or requires signing in.)")
+    elif "unavailable" in low or "removed" in low:
+        msg = ("هذا الفيديو غير متاح أو تم حذفه. "
+               "(This video is unavailable or was removed.)")
+    elif "no slides detected" in low:
+        msg = ("لم يتم العثور على شرائح في هذا الفيديو — جرّب رفع دقة "
+               "الاستخراج إلى \"عالية\". (No slides detected — try the "
+               "\"high\" sensitivity setting.)")
+    else:
+        return raw
+    return f"{msg}\n\nالتفاصيل التقنية / Details: {raw[:300]}"
+
+
 @dataclass
 class Job:
     id: str
@@ -138,7 +163,7 @@ class JobManager:
             job.message = f"{len(job.slides)} slides extracted"
         except Exception as exc:  # surfaced to the UI
             job.status = "error"
-            job.error = str(exc)
+            job.error = _friendly_error(str(exc))
             job.message = "failed"
 
     def build_custom_pdf(self, job: Job, selected: List[int]) -> str:
