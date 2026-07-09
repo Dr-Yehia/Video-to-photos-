@@ -21,6 +21,13 @@ from slide_extractor import (ExtractorConfig, SlideExtractor, __version__,
 st.set_page_config(page_title="فيديو إلى شرائح — Video to Slides",
                    page_icon="🎬", layout="wide")
 
+# Allow configuring a download proxy via Streamlit Cloud secrets.
+try:
+    if "YTDLP_PROXY" in st.secrets:
+        os.environ["YTDLP_PROXY"] = st.secrets["YTDLP_PROXY"]
+except Exception:
+    pass  # no secrets file configured
+
 # RTL support for the Arabic interface
 st.markdown(
     """
@@ -60,10 +67,14 @@ with st.form("input_form"):
                                format_func=lambda q: f"{q}p")
     with st.expander("⚙️ خيارات متقدمة — إذا رفض يوتيوب التحميل من الخادم"):
         st.markdown(
-            "يوتيوب يحجب أحياناً التحميل من خوادم السحابة (خطأ 403). "
-            "التطبيق يجرّب تلقائياً عدة طرق، وإذا استمر الرفض يمكنك رفع ملف "
-            "`cookies.txt` من متصفحك (عبر إضافة مثل *Get cookies.txt LOCALLY*) "
-            "ليتم التحميل بحسابك."
+            "يوتيوب يحجب أحياناً التحميل من خوادم السحابة. التطبيق يجرّب "
+            "تلقائياً 6 عملاء مختلفين ثم شبكات المرايا (Invidious/Piped)، "
+            "وإذا استمر الرفض:\n"
+            "- ارفع ملف `cookies.txt` من متصفحك (عبر إضافة مثل "
+            "*Get cookies.txt LOCALLY*) ليتم التحميل بحسابك — الحل الأقوى.\n"
+            "- أو أضف بروكسي في إعدادات التطبيق (Secrets): "
+            "`YTDLP_PROXY = \"http://user:pass@host:port\"` — "
+            "بروكسي منزلي/سكني يجعل النجاح شبه مضمون."
         )
         cookies_upload = st.file_uploader("ملف cookies.txt (اختياري)",
                                           type=["txt"])
@@ -137,7 +148,17 @@ if submitted:
     except Exception as exc:
         msg = str(exc)
         low = msg.lower()
-        if "403" in low or "forbidden" in low:
+        if "drm" in low:
+            st.error(
+                "🔐 أبلغ يوتيوب أن هذه النسخة محمية (DRM) — غالباً بلاغ خاطئ "
+                "يحدث مع بعض الخوادم السحابية رغم أن الفيديو عادي. الحلول:\n\n"
+                "1. **ارفع ملف cookies.txt** من \"الخيارات المتقدمة\" أعلاه.\n"
+                "2. **شغّل التطبيق على جهازك** — يعمل مباشرة.\n"
+                "3. **ارفع ملف الفيديو مباشرة** بدل الرابط."
+            )
+            with st.expander("التفاصيل التقنية"):
+                st.code(msg)
+        elif "403" in low or "forbidden" in low:
             st.error(
                 "🚫 يوتيوب يحجب التحميل من عنوان هذا الخادم السحابي (خطأ 403) "
                 "رغم تجربة عدة طرق تلقائياً. الحلول:\n\n"

@@ -59,6 +59,14 @@ class MockInvidious(BaseHTTPRequestHandler):
 
 
 def main():
+    # A false "DRM protected" report from one player client must not
+    # abort the chain: it has to be retryable so other clients and the
+    # mirror layer still get their turn.
+    assert downloader._retryable("ERROR: This video is DRM protected")
+    assert downloader._retryable("HTTP Error 403: Forbidden")
+    assert not downloader._retryable("Private video. Sign in if you've "
+                                     "been granted access")
+
     tmp = tempfile.mkdtemp(prefix="fallback_test_")
     src = os.path.join(tmp, "src.mp4")
     build_video(src)

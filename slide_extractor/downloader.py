@@ -26,14 +26,17 @@ import yt_dlp
 ProgressFn = Callable[[float, str], None]
 
 # Tried in order; None = yt-dlp's default client mix.
-_CLIENT_ATTEMPTS = (None, ["android"], ["ios"], ["tv"])
+_CLIENT_ATTEMPTS = (None, ["web_safari"], ["tv"], ["ios"], ["android"],
+                    ["mweb"])
 
 # Failures that are specific to the requesting IP/client and therefore
-# worth retrying with another client or another network path.
+# worth retrying with another client or another network path. "drm" is
+# here because some clients falsely report ordinary videos as
+# DRM-protected while other clients serve them fine.
 _RETRYABLE_MARKERS = ("403", "forbidden", "po token", "not a bot",
                       "confirm you", "unable to connect", "proxy",
                       "timed out", "429", "requested format is not available",
-                      "no video formats")
+                      "no video formats", "drm")
 
 # Public mirror instances, tried in order. Tests may monkeypatch these.
 INVIDIOUS_INSTANCES: List[str] = [
@@ -107,8 +110,14 @@ def _ytdlp_download(url: str, output_dir: str, max_height: int,
         base_opts["ffmpeg_location"] = os.path.dirname(ffmpeg)
     if cookies_file and os.path.isfile(cookies_file):
         base_opts["cookiefile"] = cookies_file
+    # A user-supplied proxy (e.g. a residential one) is the most reliable
+    # escape from YouTube's cloud-IP blocks. Set YTDLP_PROXY, e.g.
+    # "http://user:pass@host:port" or "socks5://host:port".
+    proxy = os.environ.get("YTDLP_PROXY")
+    if proxy:
+        base_opts["proxy"] = proxy
 
-    last_error: Optional[Exception] = None
+    first_error: Optional[Exception] = None
     for clients in _CLIENT_ATTEMPTS:
         opts = dict(base_opts)
         if clients:
@@ -123,11 +132,14 @@ def _ytdlp_download(url: str, output_dir: str, max_height: int,
                 "duration": info.get("duration") or 0,
             }
         except yt_dlp.utils.DownloadError as exc:
-            last_error = exc
+            # Keep the first (default-client) error: it describes the
+            # video's real situation best; later clients add noise like
+            # false DRM reports.
+            first_error = first_error or exc
             if _retryable(str(exc)):
                 continue  # another client may be accepted
             raise  # bad URL / private video etc: identical for all clients
-    raise last_error
+    raise first_error
 
 
 # ---------------------------------------------------------------------------
