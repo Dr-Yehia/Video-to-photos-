@@ -89,22 +89,17 @@ def _retryable(error_text: str) -> bool:
 # ---------------------------------------------------------------------------
 def _ytdlp_download(url: str, output_dir: str, max_height: int,
                     progress: Optional[ProgressFn],
-                    cookies_file: Optional[str]) -> dict:
+                    cookies_file: Optional[str],
+                    exact_height: bool = False) -> dict:
     def hook(d):
         if progress and d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             done = d.get("downloaded_bytes")
             if total and done:
-                progress(done / total, "downloading")
+                progress(done / total,
+                         f"{done / 1e6:.0f}MB / {total / 1e6:.0f}MB")
 
     base_opts = {
-        # "bv*/b" = best video-only stream, else best combined stream —
-        # always chosen from the formats the video ACTUALLY offers.
-        # format_sort then ranks those by closeness to the requested
-        # height (preferring mp4), so an unavailable quality can never
-        # make the download fail; the best existing one is used instead.
-        "format": "bv*/b",
-        "format_sort": [f"res:{max_height}", "vext:mp4"],
         "outtmpl": os.path.join(output_dir, "video.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
@@ -112,6 +107,8 @@ def _ytdlp_download(url: str, output_dir: str, max_height: int,
         "progress_hooks": [hook],
         "retries": 2,
         "socket_timeout": 20,
+        # Fragmented (DASH/HLS) downloads go much faster in parallel.
+        "concurrent_fragment_downloads": 4,
     }
     ffmpeg = _ffmpeg_location()
     if ffmpeg:
@@ -125,28 +122,44 @@ def _ytdlp_download(url: str, output_dir: str, max_height: int,
     if proxy:
         base_opts["proxy"] = proxy
 
+    # When the user picked a quality from the probed list, INSIST on it:
+    # round 1 accepts only that exact height on every client, and only
+    # if nothing serves it does round 2 accept the best height below it.
+    strategies = []
+    if exact_height:
+        strategies.append({
+            "format": (f"bv*[height={max_height}]"
+                       f"/b[height={max_height}]"),
+            "format_sort": ["proto:https", "vext:mp4"],
+        })
+    strategies.append({
+        "format": "bv*/b",
+        "format_sort": [f"res:{max_height}", "proto:https", "vext:mp4"],
+    })
+
     first_error: Optional[Exception] = None
-    for clients in _CLIENT_ATTEMPTS:
-        opts = dict(base_opts)
-        if clients:
-            opts["extractor_args"] = {"youtube": {"player_client": clients}}
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                path = ydl.prepare_filename(info)
-            return {
-                "path": path,
-                "title": info.get("title") or "video",
-                "duration": info.get("duration") or 0,
-            }
-        except yt_dlp.utils.DownloadError as exc:
-            # Keep the first (default-client) error: it describes the
-            # video's real situation best; later clients add noise like
-            # false DRM reports.
-            first_error = first_error or exc
-            if _retryable(str(exc)):
-                continue  # another client may be accepted
-            raise  # bad URL / private video etc: identical for all clients
+    for strategy in strategies:
+        for clients in _CLIENT_ATTEMPTS:
+            opts = {**base_opts, **strategy}
+            if clients:
+                opts["extractor_args"] = {"youtube": {"player_client": clients}}
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    path = ydl.prepare_filename(info)
+                return {
+                    "path": path,
+                    "title": info.get("title") or "video",
+                    "duration": info.get("duration") or 0,
+                }
+            except yt_dlp.utils.DownloadError as exc:
+                # Keep the first (default-client) error: it describes
+                # the video's real situation best; later clients add
+                # noise like false DRM reports.
+                first_error = first_error or exc
+                if _retryable(str(exc)):
+                    continue  # another client may be accepted
+                raise  # bad URL / private video etc: same for all clients
     raise first_error
 
 
@@ -176,7 +189,8 @@ def _download_stream(stream_url: str, dest: str,
 
 
 def _pick_stream(streams: List[dict], max_height: int,
-                 url_key: str, label_keys: tuple) -> Optional[dict]:
+                 url_key: str, label_keys: tuple,
+                 exact_height: bool = False) -> Optional[dict]:
     def height(s):
         for k in label_keys:
             h = _stream_height(str(s.get(k, "")))
@@ -188,13 +202,19 @@ def _pick_stream(streams: List[dict], max_height: int,
     mp4 = [s for s in usable if "mp4" in str(
         s.get("type", "") or s.get("mimeType", "")).lower()]
     pool = mp4 or usable
+    if exact_height:
+        # Strict round: only the requested height counts; returning None
+        # lets the caller try other instances / the relaxed round.
+        exact = [s for s in pool if height(s) == max_height]
+        return exact[0] if exact else None
     fitting = [s for s in pool if 0 < height(s) <= max_height]
     pool = fitting or pool
     return max(pool, key=height) if pool else None
 
 
 def _invidious_download(video_id: str, output_dir: str, max_height: int,
-                        progress: Optional[ProgressFn]) -> dict:
+                        progress: Optional[ProgressFn],
+                        exact_height: bool = False) -> dict:
     last_error: Optional[Exception] = None
     for inst in INVIDIOUS_INSTANCES:
         try:
@@ -209,7 +229,8 @@ def _invidious_download(video_id: str, output_dir: str, max_height: int,
             streams += [s for s in (data.get("adaptiveFormats") or [])
                         if "video" in str(s.get("type", "")).lower()]
             chosen = _pick_stream(streams, max_height, "url",
-                                  ("resolution", "qualityLabel"))
+                                  ("resolution", "qualityLabel"),
+                                  exact_height=exact_height)
             if not chosen:
                 raise RuntimeError("no usable stream in mirror response")
             # local=true proxies the bytes through the mirror instance,
@@ -229,7 +250,8 @@ def _invidious_download(video_id: str, output_dir: str, max_height: int,
 
 
 def _piped_download(video_id: str, output_dir: str, max_height: int,
-                    progress: Optional[ProgressFn]) -> dict:
+                    progress: Optional[ProgressFn],
+                    exact_height: bool = False) -> dict:
     last_error: Optional[Exception] = None
     for api in PIPED_INSTANCES:
         try:
@@ -238,7 +260,8 @@ def _piped_download(video_id: str, output_dir: str, max_height: int,
             r.raise_for_status()
             data = r.json()
             chosen = _pick_stream(list(data.get("videoStreams") or []),
-                                  max_height, "url", ("quality",))
+                                  max_height, "url", ("quality",),
+                                  exact_height=exact_height)
             if not chosen:
                 raise RuntimeError("no usable stream in mirror response")
             dest = os.path.join(output_dir, "video.mp4")
@@ -352,23 +375,44 @@ def probe_video(url: str, cookies_file: Optional[str] = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+def measure_height(video_path: str) -> int:
+    """The ACTUAL height of a downloaded file, read from the file itself
+    — the honest answer to 'what quality did I really get?'."""
+    import cv2
+    cap = cv2.VideoCapture(video_path)
+    try:
+        return int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    finally:
+        cap.release()
+
+
 def download_video(
     url: str,
     output_dir: str,
     max_height: int = 1080,
     progress: Optional[ProgressFn] = None,
     cookies_file: Optional[str] = None,
+    exact_height: bool = False,
 ) -> dict:
-    """Download a video and return {'path': ..., 'title': ..., 'duration': ...}.
+    """Download a video and return
+    {'path', 'title', 'duration', 'actual_height'}.
 
     Tries yt-dlp (several player clients), then Invidious mirrors, then
-    Piped mirrors. Raises the original yt-dlp error if every layer fails.
+    Piped mirrors. With exact_height=True the requested height is
+    demanded on every channel first, and only if nothing at all serves
+    it is the best lower height accepted. actual_height is measured
+    from the downloaded file, never assumed.
     """
     os.makedirs(output_dir, exist_ok=True)
 
+    def _finish(info: dict) -> dict:
+        info["actual_height"] = measure_height(info["path"])
+        return info
+
     try:
-        return _ytdlp_download(url, output_dir, max_height, progress,
-                               cookies_file)
+        return _finish(_ytdlp_download(url, output_dir, max_height, progress,
+                                       cookies_file,
+                                       exact_height=exact_height))
     except Exception as primary_error:
         if not _retryable(str(primary_error)):
             raise
@@ -378,8 +422,13 @@ def download_video(
         if progress:
             progress(0.0, "trying mirror networks")
         for fallback in (_invidious_download, _piped_download):
-            try:
-                return fallback(vid, output_dir, max_height, progress)
-            except Exception:
-                continue
+            # Two rounds on the mirrors as well: exact height first.
+            rounds = [True, False] if exact_height else [False]
+            for want_exact in rounds:
+                try:
+                    return _finish(fallback(vid, output_dir, max_height,
+                                            progress,
+                                            exact_height=want_exact))
+                except Exception:
+                    continue
         raise primary_error

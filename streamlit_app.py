@@ -176,10 +176,12 @@ with tab_url:
                         + " · ".join(labels))
             choice = st.selectbox("اختر الجودة", labels, index=0)
             chosen_height = int(choice.rstrip("p"))
+            exact = True
         else:
             st.info("تعذرت قراءة قائمة الجودات — سيتم تحميل أفضل جودة "
                     "متاحة تلقائياً.")
             chosen_height = 4320  # i.e. no cap: best the video offers
+            exact = False
 
         if st.button("🚀 استخراج الشرائح", type="primary",
                      use_container_width=True):
@@ -191,15 +193,27 @@ with tab_url:
                 def dl_progress(p, msg):
                     label = ("⬇️ جارٍ التحميل عبر المرايا… "
                              if "mirror" in msg else "⬇️ جارٍ التحميل… ")
-                    bar.progress(min(p, 1.0), text=f"{label}{p * 100:.0f}%")
+                    detail = f" ({msg})" if "MB" in msg else ""
+                    bar.progress(min(p, 1.0),
+                                 text=f"{label}{p * 100:.0f}%{detail}")
 
                 info = download_video(
                     url.strip(), workdir, max_height=chosen_height,
-                    progress=dl_progress,
+                    progress=dl_progress, exact_height=exact,
                     cookies_file=st.session_state.get("probe_cookies"))
                 bar.empty()
-                st.session_state["result"] = run_pipeline(
+
+                actual = info.get("actual_height") or 0
+                if exact and actual and actual != chosen_height:
+                    st.warning(
+                        f"⚠️ طلبت {chosen_height}p لكن كل القنوات المتاحة "
+                        f"رفضت هذه الجودة، فتم التحميل بأفضل جودة ممكنة: "
+                        f"**{actual}p** (مقاسة من الملف نفسه).")
+
+                result = run_pipeline(
                     info["path"], sensitivity, workdir, info["title"])
+                result["actual_height"] = actual
+                st.session_state["result"] = result
             except Exception as exc:
                 show_download_error(exc)
 
@@ -227,7 +241,10 @@ with tab_file:
 result = st.session_state.get("result")
 if result:
     slides = result["slides"]
-    st.success(f"✅ تم استخراج {len(slides)} شريحة من: {result['title']}")
+    quality_note = (f" — الجودة الفعلية: {result['actual_height']}p"
+                    if result.get("actual_height") else "")
+    st.success(f"✅ تم استخراج {len(slides)} شريحة من: "
+               f"{result['title']}{quality_note}")
 
     st.markdown("### الشرائح المستخرجة — ألغِ تحديد ما لا تريده في الـ PDF")
     cols_per_row = 4
