@@ -90,7 +90,9 @@ def _retryable(error_text: str) -> bool:
 def _ytdlp_download(url: str, output_dir: str, max_height: int,
                     progress: Optional[ProgressFn],
                     cookies_file: Optional[str],
-                    exact_height: bool = False) -> dict:
+                    exact_height: bool = False,
+                    client_attempts=_CLIENT_ATTEMPTS,
+                    log: Optional[list] = None) -> dict:
     def hook(d):
         if progress and d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
@@ -139,7 +141,7 @@ def _ytdlp_download(url: str, output_dir: str, max_height: int,
 
     first_error: Optional[Exception] = None
     for strategy in strategies:
-        for clients in _CLIENT_ATTEMPTS:
+        for clients in client_attempts:
             opts = {**base_opts, **strategy}
             if clients:
                 opts["extractor_args"] = {"youtube": {"player_client": clients}}
@@ -147,6 +149,7 @@ def _ytdlp_download(url: str, output_dir: str, max_height: int,
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=True)
                     path = ydl.prepare_filename(info)
+                _log(log, f"yt-dlp {clients or 'default'}: downloaded ✓")
                 return {
                     "path": path,
                     "title": info.get("title") or "video",
@@ -157,6 +160,8 @@ def _ytdlp_download(url: str, output_dir: str, max_height: int,
                 # the video's real situation best; later clients add
                 # noise like false DRM reports.
                 first_error = first_error or exc
+                _log(log, f"yt-dlp {clients or 'default'}: "
+                          f"{str(exc).splitlines()[0][:140]}")
                 if _retryable(str(exc)):
                     continue  # another client may be accepted
                 raise  # bad URL / private video etc: same for all clients
@@ -169,6 +174,11 @@ def _ytdlp_download(url: str, output_dir: str, max_height: int,
 def _stream_height(label: str) -> int:
     m = re.search(r"(\d{3,4})", label or "")
     return int(m.group(1)) if m else 0
+
+
+def _log(log: Optional[list], message: str):
+    if log is not None:
+        log.append(message)
 
 
 def _download_stream(stream_url: str, dest: str,
@@ -188,33 +198,41 @@ def _download_stream(stream_url: str, dest: str,
         raise RuntimeError("mirror returned a non-video response")
 
 
-def _pick_stream(streams: List[dict], max_height: int,
-                 url_key: str, label_keys: tuple,
-                 exact_height: bool = False) -> Optional[dict]:
-    def height(s):
-        for k in label_keys:
-            h = _stream_height(str(s.get(k, "")))
-            if h:
-                return h
-        return 0
+def _candidate_height(s: dict, label_keys: tuple) -> int:
+    for k in label_keys:
+        h = _stream_height(str(s.get(k, "")))
+        if h:
+            return h
+    return 0
+
+
+def _ordered_candidates(streams: List[dict], max_height: int,
+                        url_key: str, label_keys: tuple,
+                        exact_height: bool = False) -> List[dict]:
+    """ALL usable streams in the order they should be attempted: when a
+    stream fails to download, the next candidate (same height in another
+    codec, then the next height down) still gets its chance — one broken
+    stream must never collapse the quality all the way to the bottom."""
+    def is_mp4(s):
+        return "mp4" in str(s.get("type", "") or s.get("mimeType", "")).lower()
 
     usable = [s for s in streams if s.get(url_key)]
-    mp4 = [s for s in usable if "mp4" in str(
-        s.get("type", "") or s.get("mimeType", "")).lower()]
-    pool = mp4 or usable
     if exact_height:
-        # Strict round: only the requested height counts; returning None
-        # lets the caller try other instances / the relaxed round.
-        exact = [s for s in pool if height(s) == max_height]
-        return exact[0] if exact else None
-    fitting = [s for s in pool if 0 < height(s) <= max_height]
-    pool = fitting or pool
-    return max(pool, key=height) if pool else None
+        # Strict round: only the requested height counts.
+        pool = [s for s in usable
+                if _candidate_height(s, label_keys) == max_height]
+    else:
+        pool = [s for s in usable
+                if 0 < _candidate_height(s, label_keys) <= max_height]
+        pool = pool or usable
+    return sorted(pool, key=lambda s: (_candidate_height(s, label_keys),
+                                       is_mp4(s)), reverse=True)
 
 
 def _invidious_download(video_id: str, output_dir: str, max_height: int,
                         progress: Optional[ProgressFn],
-                        exact_height: bool = False) -> dict:
+                        exact_height: bool = False,
+                        log: Optional[list] = None) -> dict:
     last_error: Optional[Exception] = None
     for inst in INVIDIOUS_INSTANCES:
         try:
@@ -225,33 +243,45 @@ def _invidious_download(video_id: str, output_dir: str, max_height: int,
                 timeout=15, headers={"User-Agent": _UA})
             r.raise_for_status()
             data = r.json()
-            streams = list(data.get("formatStreams") or [])
-            streams += [s for s in (data.get("adaptiveFormats") or [])
-                        if "video" in str(s.get("type", "")).lower()]
-            chosen = _pick_stream(streams, max_height, "url",
-                                  ("resolution", "qualityLabel"),
-                                  exact_height=exact_height)
-            if not chosen:
-                raise RuntimeError("no usable stream in mirror response")
-            # local=true proxies the bytes through the mirror instance,
-            # sidestepping YouTube's block of our own IP.
-            stream_url = chosen["url"]
-            stream_url += ("&" if "?" in stream_url else "?") + "local=true"
-            dest = os.path.join(output_dir, "video.mp4")
-            _download_stream(stream_url, dest, progress)
-            return {
-                "path": dest,
-                "title": data.get("title") or "video",
-                "duration": data.get("lengthSeconds") or 0,
-            }
         except Exception as exc:
             last_error = exc
+            _log(log, f"invidious {inst}: API unreachable ({exc})")
+            continue
+        streams = list(data.get("formatStreams") or [])
+        streams += [s for s in (data.get("adaptiveFormats") or [])
+                    if "video" in str(s.get("type", "")).lower()]
+        label_keys = ("resolution", "qualityLabel")
+        candidates = _ordered_candidates(streams, max_height, "url",
+                                         label_keys,
+                                         exact_height=exact_height)
+        if not candidates:
+            _log(log, f"invidious {inst}: no stream at "
+                      f"{'exactly ' if exact_height else '≤'}{max_height}p")
+        for s in candidates:
+            h = _candidate_height(s, label_keys)
+            # local=true proxies the bytes through the mirror instance,
+            # sidestepping YouTube's block of our own IP.
+            stream_url = s["url"]
+            stream_url += ("&" if "?" in stream_url else "?") + "local=true"
+            dest = os.path.join(output_dir, "video.mp4")
+            try:
+                _download_stream(stream_url, dest, progress)
+                _log(log, f"invidious {inst}: downloaded {h}p ✓")
+                return {
+                    "path": dest,
+                    "title": data.get("title") or "video",
+                    "duration": data.get("lengthSeconds") or 0,
+                }
+            except Exception as exc:
+                last_error = exc
+                _log(log, f"invidious {inst} {h}p: {exc}")
     raise last_error or RuntimeError("no Invidious instance available")
 
 
 def _piped_download(video_id: str, output_dir: str, max_height: int,
                     progress: Optional[ProgressFn],
-                    exact_height: bool = False) -> dict:
+                    exact_height: bool = False,
+                    log: Optional[list] = None) -> dict:
     last_error: Optional[Exception] = None
     for api in PIPED_INSTANCES:
         try:
@@ -259,20 +289,30 @@ def _piped_download(video_id: str, output_dir: str, max_height: int,
                              headers={"User-Agent": _UA})
             r.raise_for_status()
             data = r.json()
-            chosen = _pick_stream(list(data.get("videoStreams") or []),
-                                  max_height, "url", ("quality",),
-                                  exact_height=exact_height)
-            if not chosen:
-                raise RuntimeError("no usable stream in mirror response")
-            dest = os.path.join(output_dir, "video.mp4")
-            _download_stream(chosen["url"], dest, progress)
-            return {
-                "path": dest,
-                "title": data.get("title") or "video",
-                "duration": data.get("duration") or 0,
-            }
         except Exception as exc:
             last_error = exc
+            _log(log, f"piped {api}: API unreachable ({exc})")
+            continue
+        candidates = _ordered_candidates(
+            list(data.get("videoStreams") or []), max_height, "url",
+            ("quality",), exact_height=exact_height)
+        if not candidates:
+            _log(log, f"piped {api}: no stream at "
+                      f"{'exactly ' if exact_height else '≤'}{max_height}p")
+        for s in candidates:
+            h = _candidate_height(s, ("quality",))
+            dest = os.path.join(output_dir, "video.mp4")
+            try:
+                _download_stream(s["url"], dest, progress)
+                _log(log, f"piped {api}: downloaded {h}p ✓")
+                return {
+                    "path": dest,
+                    "title": data.get("title") or "video",
+                    "duration": data.get("duration") or 0,
+                }
+            except Exception as exc:
+                last_error = exc
+                _log(log, f"piped {api} {h}p: {exc}")
     raise last_error or RuntimeError("no Piped instance available")
 
 
@@ -393,6 +433,8 @@ def download_video(
     progress: Optional[ProgressFn] = None,
     cookies_file: Optional[str] = None,
     exact_height: bool = False,
+    source_hint: Optional[str] = None,
+    attempt_log: Optional[list] = None,
 ) -> dict:
     """Download a video and return
     {'path', 'title', 'duration', 'actual_height'}.
@@ -402,6 +444,11 @@ def download_video(
     demanded on every channel first, and only if nothing at all serves
     it is the best lower height accepted. actual_height is measured
     from the downloaded file, never assumed.
+
+    source_hint (from probe_video's 'source') skips the long yt-dlp
+    client parade when the probe already proved YouTube is blocked for
+    this server, and tries the mirror network that worked first.
+    attempt_log, if given, collects a human-readable line per attempt.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -409,10 +456,19 @@ def download_video(
         info["actual_height"] = measure_height(info["path"])
         return info
 
+    # If the probe already reached the video through a mirror, YouTube
+    # itself is blocked here: one quick yt-dlp try (in case the network
+    # recovered), then straight to the mirrors instead of 12 doomed
+    # attempts.
+    mirror_hint = source_hint in ("invidious", "piped")
+    clients = (None,) if mirror_hint else _CLIENT_ATTEMPTS
+
     try:
         return _finish(_ytdlp_download(url, output_dir, max_height, progress,
                                        cookies_file,
-                                       exact_height=exact_height))
+                                       exact_height=exact_height,
+                                       client_attempts=clients,
+                                       log=attempt_log))
     except Exception as primary_error:
         if not _retryable(str(primary_error)):
             raise
@@ -421,14 +477,18 @@ def download_video(
             raise
         if progress:
             progress(0.0, "trying mirror networks")
-        for fallback in (_invidious_download, _piped_download):
-            # Two rounds on the mirrors as well: exact height first.
-            rounds = [True, False] if exact_height else [False]
-            for want_exact in rounds:
+        fallbacks = [_invidious_download, _piped_download]
+        if source_hint == "piped":
+            fallbacks.reverse()
+        # Strict rounds on BOTH mirror networks first, then relaxed.
+        rounds = [True, False] if exact_height else [False]
+        for want_exact in rounds:
+            for fallback in fallbacks:
                 try:
                     return _finish(fallback(vid, output_dir, max_height,
                                             progress,
-                                            exact_height=want_exact))
+                                            exact_height=want_exact,
+                                            log=attempt_log))
                 except Exception:
                     continue
         raise primary_error

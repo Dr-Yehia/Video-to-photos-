@@ -54,7 +54,7 @@ SENSITIVITY_LABELS = {
 }
 
 
-def show_download_error(exc: Exception):
+def show_download_error(exc: Exception, attempt_log=None):
     msg = str(exc)
     low = msg.lower()
     if "drm" in low:
@@ -79,9 +79,14 @@ def show_download_error(exc: Exception):
                  "أو ارفع ملف الفيديو مباشرة.")
     else:
         st.error(f"فشل التنفيذ: {msg}")
+        if attempt_log:
+            with st.expander("سجل المحاولات"):
+                st.code("\n".join(attempt_log))
         return
     with st.expander("التفاصيل التقنية"):
         st.code(msg)
+        if attempt_log:
+            st.code("\n".join(attempt_log))
 
 
 def run_pipeline(video_path: str, sensitivity: str, workdir: str,
@@ -186,6 +191,7 @@ with tab_url:
         if st.button("🚀 استخراج الشرائح", type="primary",
                      use_container_width=True):
             st.session_state.pop("result", None)
+            attempt_log = []
             try:
                 workdir = st.session_state["probe_workdir"]
                 bar = st.progress(0.0, text="⬇️ جارٍ تحميل الفيديو…")
@@ -200,6 +206,8 @@ with tab_url:
                 info = download_video(
                     url.strip(), workdir, max_height=chosen_height,
                     progress=dl_progress, exact_height=exact,
+                    source_hint=probe.get("source"),
+                    attempt_log=attempt_log,
                     cookies_file=st.session_state.get("probe_cookies"))
                 bar.empty()
 
@@ -209,13 +217,16 @@ with tab_url:
                         f"⚠️ طلبت {chosen_height}p لكن كل القنوات المتاحة "
                         f"رفضت هذه الجودة، فتم التحميل بأفضل جودة ممكنة: "
                         f"**{actual}p** (مقاسة من الملف نفسه).")
+                    with st.expander("سجل المحاولات — لماذا لم تنجح "
+                                     f"{chosen_height}p؟"):
+                        st.code("\n".join(attempt_log) or "(فارغ)")
 
                 result = run_pipeline(
                     info["path"], sensitivity, workdir, info["title"])
                 result["actual_height"] = actual
                 st.session_state["result"] = result
             except Exception as exc:
-                show_download_error(exc)
+                show_download_error(exc, attempt_log)
 
 # --------------------------------------------------------------- File tab
 with tab_file:

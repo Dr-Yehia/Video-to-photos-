@@ -44,7 +44,9 @@ def upscale_video(src: str, dest: str, width: int, height: int):
 
 
 class MockInvidious(BaseHTTPRequestHandler):
-    # itag -> raw video bytes; filled in main()
+    # itag -> raw video bytes, or None to simulate a stream that exists
+    # in the metadata but fails to download (the real production case:
+    # 1080p is listed but its proxied stream errors out).
     streams = {}
 
     def do_GET(self):
@@ -58,6 +60,9 @@ class MockInvidious(BaseHTTPRequestHandler):
                      "type": "video/mp4", "resolution": "360p"},
                 ],
                 "adaptiveFormats": [
+                    {"url": f"http://127.0.0.1:{port}/videoplayback?itag=137",
+                     "type": "video/mp4; codecs=\"avc1\"",
+                     "qualityLabel": "1080p"},
                     {"url": f"http://127.0.0.1:{port}/videoplayback?itag=136",
                      "type": "video/mp4; codecs=\"avc1\"",
                      "qualityLabel": "720p"},
@@ -70,8 +75,13 @@ class MockInvidious(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path.startswith("/videoplayback"):
             assert "local=true" in self.path, "stream must be proxied"
-            itag = 136 if "itag=136" in self.path else 18
-            data = self.streams[itag]
+            itag = 137 if "itag=137" in self.path else (
+                136 if "itag=136" in self.path else 18)
+            data = self.streams.get(itag)
+            if data is None:  # broken stream
+                self.send_response(500)
+                self.end_headers()
+                return
             self.send_response(200)
             self.send_header("Content-Type", "video/mp4")
             self.send_header("Content-Length", str(len(data)))
@@ -99,8 +109,11 @@ def main():
     src720 = os.path.join(tmp, "src720.mp4")
     build_video(src360)                       # 640x360 lecture
     upscale_video(src360, src720, 1280, 720)  # same content at 720p
+    # 1080p (itag 137) is listed in the metadata but BROKEN on download
+    # — the exact production failure the graceful degradation must fix.
     MockInvidious.streams = {18: open(src360, "rb").read(),
-                             136: open(src720, "rb").read()}
+                             136: open(src720, "rb").read(),
+                             137: None}
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), MockInvidious)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -116,21 +129,34 @@ def main():
     probe = downloader.probe_video(url)
     print(f"  probe    : {probe}")
     assert probe["title"] == "Mock Lecture"
-    assert probe["heights"] == [720, 360]
+    assert probe["heights"] == [1080, 720, 360]
     assert probe["source"] == "invidious"
 
     # 2) exact quality selection, verified by measuring the file
     for want in (720, 360):
-        events = []
         info = downloader.download_video(
             url, os.path.join(tmp, f"out{want}"), max_height=want,
-            exact_height=True, progress=lambda p, m: events.append(m))
+            exact_height=True, source_hint=probe["source"])
         print(f"  requested {want}p -> measured {info['actual_height']}p "
               f"({os.path.getsize(info['path'])} bytes)")
         assert info["actual_height"] == want, info
-        assert any("mirror" in e for e in events), events
 
-    # 3) the downloaded file must be a decodable video
+    # 3) graceful degradation: 1080p exists but its stream is broken —
+    # the chain must fall to the NEXT height (720p), not collapse to
+    # the bottom (360p), and the attempt log must tell the story.
+    log = []
+    info = downloader.download_video(
+        url, os.path.join(tmp, "out1080"), max_height=1080,
+        exact_height=True, source_hint=probe["source"], attempt_log=log)
+    print(f"  requested 1080p (broken) -> measured "
+          f"{info['actual_height']}p")
+    print("  attempt log:")
+    for line in log:
+        print(f"    {line}")
+    assert info["actual_height"] == 720, info
+    assert any("1080p" in e for e in log), log
+
+    # 4) the downloaded file must be a decodable video
     cap = cv2.VideoCapture(info["path"])
     assert cap.isOpened() and cap.read()[0], "downloaded video not decodable"
     cap.release()
