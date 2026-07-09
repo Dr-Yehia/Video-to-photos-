@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>فيديو إلى شرائح — Video to Slides</title>
+<style>
+  :root {
+    --bg: #0f1420; --card: #1a2232; --card2: #212b3f;
+    --accent: #4f8cff; --accent2: #34d399; --text: #e8edf6;
+    --muted: #93a1b8; --danger: #f87171; --radius: 14px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI", Tahoma, system-ui, sans-serif;
+    background: linear-gradient(160deg, #0f1420 0%, #141b2e 100%);
+    color: var(--text); min-height: 100vh; padding: 24px 16px;
+  }
+  .container { max-width: 1000px; margin: 0 auto; }
+  header { text-align: center; margin-bottom: 28px; }
+  header h1 { font-size: 1.9rem; margin-bottom: 8px; }
+  header h1 .grad {
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  header p { color: var(--muted); font-size: .95rem; line-height: 1.7; }
+
+  .card {
+    background: var(--card); border: 1px solid #2a3550;
+    border-radius: var(--radius); padding: 22px; margin-bottom: 20px;
+  }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  input[type=url] {
+    flex: 1 1 300px; padding: 13px 16px; border-radius: 10px;
+    border: 1px solid #33415e; background: var(--card2); color: var(--text);
+    font-size: 1rem; direction: ltr; text-align: left;
+  }
+  input[type=url]:focus { outline: 2px solid var(--accent); border-color: transparent; }
+  button {
+    padding: 13px 22px; border: none; border-radius: 10px; cursor: pointer;
+    font-size: 1rem; font-weight: 600; color: #fff;
+    background: linear-gradient(90deg, var(--accent), #6d6dff);
+    transition: opacity .15s;
+  }
+  button:hover { opacity: .88; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.secondary { background: var(--card2); border: 1px solid #33415e; }
+  button.success { background: linear-gradient(90deg, #10b981, #34d399); }
+
+  .options { display: flex; gap: 18px; margin-top: 14px; flex-wrap: wrap;
+             color: var(--muted); font-size: .92rem; align-items: center; }
+  .options select {
+    margin-inline-start: 6px; padding: 6px 10px; border-radius: 8px;
+    background: var(--card2); color: var(--text); border: 1px solid #33415e;
+  }
+
+  .progress-wrap { display: none; }
+  .bar-outer { background: var(--card2); border-radius: 99px; height: 14px;
+               overflow: hidden; margin: 12px 0 8px; }
+  .bar-inner { height: 100%; width: 0%;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    border-radius: 99px; transition: width .4s; }
+  .status-line { color: var(--muted); font-size: .9rem; display: flex;
+                 justify-content: space-between; flex-wrap: wrap; gap: 6px; }
+  .error-box { display: none; background: #3a1b23; border: 1px solid var(--danger);
+               color: #fecaca; padding: 14px 16px; border-radius: 10px;
+               margin-top: 12px; font-size: .92rem; line-height: 1.7; }
+
+  .results { display: none; }
+  .results-head { display: flex; justify-content: space-between; align-items: center;
+                  flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+  .results-head h2 { font-size: 1.15rem; }
+  .results-head .count { color: var(--accent2); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+          gap: 14px; }
+  .slide {
+    background: var(--card2); border-radius: 10px; overflow: hidden;
+    border: 2px solid transparent; cursor: pointer; position: relative;
+    transition: border-color .15s;
+  }
+  .slide img { width: 100%; display: block; aspect-ratio: 16/9; object-fit: cover; }
+  .slide .meta { padding: 8px 10px; font-size: .8rem; color: var(--muted);
+                 display: flex; justify-content: space-between; }
+  .slide.selected { border-color: var(--accent2); }
+  .slide .check {
+    position: absolute; top: 8px; inset-inline-start: 8px;
+    width: 24px; height: 24px; border-radius: 6px; background: rgba(0,0,0,.55);
+    border: 2px solid #fff; display: flex; align-items: center;
+    justify-content: center; font-size: 15px; color: transparent;
+  }
+  .slide.selected .check { background: var(--accent2); color: #06281c; }
+
+  .lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.85);
+              z-index: 50; align-items: center; justify-content: center; padding: 20px; }
+  .lightbox img { max-width: 95vw; max-height: 92vh; border-radius: 8px; }
+
+  footer { text-align: center; color: #5d6b84; font-size: .82rem; margin-top: 30px;
+           line-height: 1.8; }
+  footer span { direction: ltr; unicode-bidi: embed; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>🎬 <span class="grad">فيديو إلى شرائح</span> 📄</h1>
+    <p>حوّل أي فيديو يوتيوب إلى صور وملف PDF بأعلى جودة — يلتقط كل شريحة في أكمل حالتها بعد انتهاء الكتابة عليها، بدون تكرار وبدون صفحات ناقصة.</p>
+  </header>
+
+  <div class="card">
+    <div class="row">
+      <input type="url" id="url" placeholder="https://www.youtube.com/watch?v=..." />
+      <button id="startBtn" onclick="start()">استخراج الشرائح</button>
+    </div>
+    <div class="options" style="margin-top:12px">
+      <label style="cursor:pointer;color:var(--accent)">
+        📁 أو ارفع ملف فيديو من جهازك
+        <input type="file" id="fileInput" accept="video/*" style="display:none"
+               onchange="startUpload(this.files[0])">
+      </label>
+    </div>
+    <div class="options">
+      <label>دقة الاستخراج:
+        <select id="sensitivity">
+          <option value="low">منخفضة — التغييرات الكبيرة فقط</option>
+          <option value="medium" selected>متوسطة — موصى بها</option>
+          <option value="high">عالية — يلتقط تغييرات أدق</option>
+        </select>
+      </label>
+      <label>جودة الفيديو:
+        <select id="quality">
+          <option value="720">720p — أسرع</option>
+          <option value="1080" selected>1080p — أعلى جودة</option>
+        </select>
+      </label>
+    </div>
+    <div class="error-box" id="errorBox"></div>
+  </div>
+
+  <div class="card progress-wrap" id="progressCard">
+    <div class="status-line">
+      <span id="statusText">جارٍ البدء…</span>
+      <span id="statusPct">0%</span>
+    </div>
+    <div class="bar-outer"><div class="bar-inner" id="bar"></div></div>
+    <div class="status-line"><span id="videoTitle"></span></div>
+  </div>
+
+  <div class="card results" id="results">
+    <div class="results-head">
+      <h2>الشرائح المستخرجة <span class="count" id="slideCount"></span></h2>
+      <div class="row">
+        <button class="secondary" onclick="toggleAll()">تحديد / إلغاء الكل</button>
+        <button class="success" onclick="downloadPdf()">⬇️ تحميل PDF</button>
+        <button class="secondary" onclick="downloadZip()">⬇️ تحميل الصور ZIP</button>
+      </div>
+    </div>
+    <p style="color:var(--muted);font-size:.88rem;margin-bottom:14px">
+      اضغط على أي شريحة لإلغاء تحديدها فلا تدخل في ملف الـ PDF، واضغط مطولاً (أو انقر على الصورة نفسها) لتكبيرها.
+    </p>
+    <div class="grid" id="grid"></div>
+  </div>
+
+  <footer>
+    مبني بمكتبات مفتوحة المصدر:
+    <span>yt-dlp · OpenCV · ImageHash · img2pdf · FastAPI</span>
+  </footer>
+</div>
+
+<div class="lightbox" id="lightbox" onclick="this.style.display='none'">
+  <img id="lightboxImg" src="" alt="">
+</div>
+
+<script>
+let jobId = null, pollTimer = null, slides = [], selected = new Set();
+
+async function start() {
+  const url = document.getElementById('url').value.trim();
+  const errBox = document.getElementById('errorBox');
+  errBox.style.display = 'none';
+  if (!url) { showError('من فضلك أدخل رابط الفيديو أولاً.'); return; }
+
+  document.getElementById('startBtn').disabled = true;
+  document.getElementById('results').style.display = 'none';
+  document.getElementById('progressCard').style.display = 'block';
+  setProgress(0, 'جارٍ البدء…');
+
+  try {
+    const res = await fetch('/api/jobs', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        url,
+        sensitivity: document.getElementById('sensitivity').value,
+        max_height: parseInt(document.getElementById('quality').value),
+      })
+    });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const job = await res.json();
+    jobId = job.id;
+    pollTimer = setInterval(poll, 1500);
+  } catch (e) {
+    showError('تعذر بدء المهمة: ' + e.message);
+    document.getElementById('startBtn').disabled = false;
+    document.getElementById('progressCard').style.display = 'none';
+  }
+}
+
+async function startUpload(file) {
+  if (!file) return;
+  const errBox = document.getElementById('errorBox');
+  errBox.style.display = 'none';
+  document.getElementById('startBtn').disabled = true;
+  document.getElementById('results').style.display = 'none';
+  document.getElementById('progressCard').style.display = 'block';
+  setProgress(0, '⬆️ جارٍ رفع الملف…');
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('sensitivity', document.getElementById('sensitivity').value);
+    const res = await fetch('/api/jobs/upload', {method: 'POST', body: fd});
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const job = await res.json();
+    jobId = job.id;
+    pollTimer = setInterval(poll, 1500);
+  } catch (e) {
+    showError('تعذر رفع الملف: ' + e.message);
+    document.getElementById('startBtn').disabled = false;
+    document.getElementById('progressCard').style.display = 'none';
+  }
+}
+
+const STATUS_AR = {
+  queued: 'في الانتظار…',
+  downloading: '⬇️ جارٍ تحميل الفيديو من يوتيوب…',
+  extracting: '🔍 جارٍ تحليل الفيديو واستخراج الشرائح بذكاء…',
+  done: '✅ اكتمل الاستخراج!',
+  error: '❌ حدث خطأ',
+};
+
+async function poll() {
+  try {
+    const res = await fetch('/api/jobs/' + jobId);
+    if (!res.ok) return;
+    const job = await res.json();
+    setProgress(job.progress, STATUS_AR[job.status] || job.message);
+    if (job.title)
+      document.getElementById('videoTitle').textContent = '🎥 ' + job.title;
+
+    if (job.status === 'done') {
+      clearInterval(pollTimer);
+      document.getElementById('startBtn').disabled = false;
+      setProgress(1, STATUS_AR.done);
+      showSlides(job.slides);
+    } else if (job.status === 'error') {
+      clearInterval(pollTimer);
+      document.getElementById('startBtn').disabled = false;
+      document.getElementById('progressCard').style.display = 'none';
+      showError('فشل الاستخراج: ' + job.error);
+    }
+  } catch (e) { /* transient network issue — keep polling */ }
+}
+
+function setProgress(p, text) {
+  document.getElementById('bar').style.width = (p * 100).toFixed(0) + '%';
+  document.getElementById('statusPct').textContent = (p * 100).toFixed(0) + '%';
+  document.getElementById('statusText').textContent = text;
+}
+
+function showError(msg) {
+  const box = document.getElementById('errorBox');
+  box.textContent = msg;
+  box.style.display = 'block';
+}
+
+function fmtTime(s) {
+  const m = Math.floor(s / 60), sec = Math.floor(s % 60);
+  return m + ':' + String(sec).padStart(2, '0');
+}
+
+function showSlides(list) {
+  slides = list;
+  selected = new Set(list.map(s => s.index));
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  list.forEach(s => {
+    const div = document.createElement('div');
+    div.className = 'slide selected';
+    div.dataset.index = s.index;
+    div.innerHTML = `
+      <div class="check">✓</div>
+      <img loading="lazy" src="/api/jobs/${jobId}/slides/${s.file}" alt="شريحة ${s.index + 1}">
+      <div class="meta"><span>شريحة ${s.index + 1}</span><span>⏱ ${fmtTime(s.timestamp)}</span></div>`;
+    div.querySelector('img').addEventListener('click', ev => {
+      ev.stopPropagation();
+      document.getElementById('lightboxImg').src = ev.target.src;
+      document.getElementById('lightbox').style.display = 'flex';
+    });
+    div.addEventListener('click', () => toggle(div, s.index));
+    grid.appendChild(div);
+  });
+  updateCount();
+  document.getElementById('results').style.display = 'block';
+  document.getElementById('results').scrollIntoView({behavior: 'smooth'});
+}
+
+function toggle(div, index) {
+  if (selected.has(index)) { selected.delete(index); div.classList.remove('selected'); }
+  else { selected.add(index); div.classList.add('selected'); }
+  updateCount();
+}
+
+function toggleAll() {
+  const all = selected.size < slides.length;
+  selected = all ? new Set(slides.map(s => s.index)) : new Set();
+  document.querySelectorAll('.slide').forEach(d =>
+    d.classList.toggle('selected', all));
+  updateCount();
+}
+
+function updateCount() {
+  document.getElementById('slideCount').textContent =
+    `(${selected.size} من ${slides.length} محددة)`;
+}
+
+async function downloadPdf() {
+  if (selected.size === 0) { showError('اختر شريحة واحدة على الأقل.'); return; }
+  if (selected.size === slides.length) {
+    window.location = `/api/jobs/${jobId}/pdf`;
+    return;
+  }
+  const res = await fetch(`/api/jobs/${jobId}/pdf`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({selected: [...selected]})
+  });
+  if (res.ok) window.location = (await res.json()).url;
+  else showError('تعذر إنشاء الـ PDF.');
+}
+
+function downloadZip() { window.location = `/api/jobs/${jobId}/zip`; }
+</script>
+</body>
+</html>

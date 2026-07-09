@@ -1,0 +1,10 @@
+yt-dlp>=2024.12.13
+opencv-python-headless>=4.9
+numpy>=1.24
+Pillow>=10.0
+ImageHash>=4.3
+img2pdf>=0.5
+fastapi>=0.110
+uvicorn>=0.27
+python-multipart>=0.0.9
+imageio-ffmpeg>=0.4.9
