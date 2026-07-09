@@ -27,6 +27,17 @@
 
 ## 🚀 التشغيل
 
+### الطريقة 1: Streamlit (الأسهل — موصى بها على اللابتوب)
+
+```bash
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+يفتح المتصفح تلقائياً. يمكن نشره مجاناً على [Streamlit Community Cloud](https://streamlit.io/cloud) — لكن انتبه: يوتيوب كثيراً ما يحجب التحميل من خوادم السحابة، فاستخدم خيار "رفع ملف" هناك، أما على جهازك فروابط يوتيوب تعمل طبيعياً.
+
+### الطريقة 2: FastAPI
+
 ```bash
 pip install -r requirements.txt
 python app.py
