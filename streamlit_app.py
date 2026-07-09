@@ -58,6 +58,15 @@ with st.form("input_form"):
     with col2:
         quality = st.selectbox("جودة تحميل الفيديو", [720, 1080], index=1,
                                format_func=lambda q: f"{q}p")
+    with st.expander("⚙️ خيارات متقدمة — إذا رفض يوتيوب التحميل من الخادم"):
+        st.markdown(
+            "يوتيوب يحجب أحياناً التحميل من خوادم السحابة (خطأ 403). "
+            "التطبيق يجرّب تلقائياً عدة طرق، وإذا استمر الرفض يمكنك رفع ملف "
+            "`cookies.txt` من متصفحك (عبر إضافة مثل *Get cookies.txt LOCALLY*) "
+            "ليتم التحميل بحسابك."
+        )
+        cookies_upload = st.file_uploader("ملف cookies.txt (اختياري)",
+                                          type=["txt"])
     submitted = st.form_submit_button("🚀 استخراج الشرائح",
                                       use_container_width=True)
 
@@ -107,9 +116,16 @@ if submitted:
                 bar.progress(min(p, 1.0),
                              text=f"⬇️ جارٍ التحميل… {p * 100:.0f}%")
 
+            cookies_path = None
+            if cookies_upload is not None:
+                cookies_path = os.path.join(workdir, "cookies.txt")
+                with open(cookies_path, "wb") as f:
+                    f.write(cookies_upload.getbuffer())
+
             info = download_video(url.strip(), workdir,
                                   max_height=int(quality),
-                                  progress=dl_progress)
+                                  progress=dl_progress,
+                                  cookies_file=cookies_path)
             bar.empty()
             video_path, title = info["path"], info["title"]
         else:
@@ -120,8 +136,20 @@ if submitted:
             video_path, SENSITIVITY_LABELS[sens_label], workdir, title)
     except Exception as exc:
         msg = str(exc)
-        if any(k in msg.lower() for k in ("proxy", "403", "unable to connect",
-                                          "timed out", "getaddrinfo")):
+        low = msg.lower()
+        if "403" in low or "forbidden" in low:
+            st.error(
+                "🚫 يوتيوب يحجب التحميل من عنوان هذا الخادم السحابي (خطأ 403) "
+                "رغم تجربة عدة طرق تلقائياً. الحلول:\n\n"
+                "1. **شغّل التطبيق على جهازك** — يعمل مباشرة بدون أي مشكلة.\n"
+                "2. **ارفع ملف cookies.txt** من \"الخيارات المتقدمة\" أعلاه.\n"
+                "3. **ارفع ملف الفيديو مباشرة** بدل الرابط (حمّله على جهازك "
+                "أولاً ثم ارفعه هنا)."
+            )
+            with st.expander("التفاصيل التقنية"):
+                st.code(msg)
+        elif any(k in low for k in ("proxy", "unable to connect",
+                                    "timed out", "getaddrinfo")):
             st.error("تعذر الوصول إلى يوتيوب من هذا الخادم — جرّب من شبكة "
                      "أخرى أو ارفع ملف الفيديو مباشرة.")
             with st.expander("التفاصيل التقنية"):
