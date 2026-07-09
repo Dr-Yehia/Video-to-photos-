@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from typing import Callable, List, Optional
 
 import requests
@@ -85,11 +86,20 @@ def _discover_instances(kind: str) -> List[str]:
                              timeout=10, headers={"User-Agent": _UA})
             r.raise_for_status()
             entries = r.json()
-            entries = entries if isinstance(entries, list) else []
-            entries.sort(key=lambda e: -(e.get("score") or e.get("trust") or 0)
-                         if isinstance(e, dict) else 0)
+            if isinstance(entries, dict):  # {"instances": [...]} shape
+                entries = (entries.get("instances")
+                           or entries.get("data") or [])
+            entries = [e for e in entries if isinstance(e, dict)]
+            entries.sort(key=lambda e: -(e.get("score")
+                                         or e.get("trust") or 0))
             for e in entries:
-                if not isinstance(e, dict):
+                # Skip instances that can't serve us: YouTube disabled,
+                # or auth (JWT/key/turnstile) required.
+                services = e.get("services")
+                if isinstance(services, dict) and \
+                        services.get("youtube") is False:
+                    continue
+                if e.get("turnstile") or e.get("auth") or e.get("jwt"):
                     continue
                 api = str(e.get("api") or e.get("api_url") or "").rstrip("/")
                 if not api:
@@ -118,16 +128,22 @@ def _discover_instances(kind: str) -> List[str]:
                     found.append(api_url)
     except Exception:
         found = []
-    _REGISTRY_CACHE[kind] = found[:8]  # healthiest few; keep runtime sane
+    cap = 12 if kind == "cobalt" else 8  # cobalt calls are cheap to skip
+    _REGISTRY_CACHE[kind] = found[:cap]
     return _REGISTRY_CACHE[kind]
 
 
 def _mirror_instances(kind: str) -> List[str]:
     """Live registry instances first (healthiest), the static list as a
-    backup, de-duplicated preserving order."""
+    backup, de-duplicated preserving order. Env overrides are re-read
+    at call time so Streamlit secrets applied after import still win."""
+    env_var = {"invidious": "V2S_INVIDIOUS_INSTANCES",
+               "piped": "V2S_PIPED_INSTANCES",
+               "cobalt": "V2S_COBALT_INSTANCES"}[kind]
     static = {"invidious": INVIDIOUS_INSTANCES,
               "piped": PIPED_INSTANCES,
               "cobalt": COBALT_INSTANCES}[kind]
+    static = _env_instances(env_var, static)
     seen, merged = set(), []
     for inst in _discover_instances(kind) + static:
         if inst not in seen:
@@ -216,6 +232,7 @@ def _ytdlp_download(url: str, output_dir: str, max_height: int,
     })
 
     first_error: Optional[Exception] = None
+    saw_format_issue = False
     for strategy in strategies:
         for clients in client_attempts:
             opts = {**base_opts, **strategy}
@@ -236,11 +253,19 @@ def _ytdlp_download(url: str, output_dir: str, max_height: int,
                 # the video's real situation best; later clients add
                 # noise like false DRM reports.
                 first_error = first_error or exc
+                low = str(exc).lower()
+                if "requested format" in low or "no video formats" in low:
+                    saw_format_issue = True
                 _log(log, f"yt-dlp {clients or 'default'}: "
                           f"{str(exc).splitlines()[0][:140]}")
                 if _retryable(str(exc)):
                     continue  # another client may be accepted
                 raise  # bad URL / private video etc: same for all clients
+        # If every failure was IP-level (403/bot-check/DRM) rather than
+        # format-related, relaxing the format cannot help — skip the
+        # second parade instead of burning another 30 seconds.
+        if not saw_format_issue:
+            break
     raise first_error
 
 
@@ -369,27 +394,118 @@ def _piped_download(video_id: str, output_dir: str, max_height: int,
             last_error = exc
             _log(log, f"piped {api}: API unreachable ({exc})")
             continue
-        candidates = _ordered_candidates(
-            list(data.get("videoStreams") or []), max_height, "url",
-            ("quality",), exact_height=exact_height)
-        if not candidates:
-            _log(log, f"piped {api}: no stream at "
-                      f"{'exactly ' if exact_height else '≤'}{max_height}p")
-        for s in candidates:
-            h = _candidate_height(s, ("quality",))
-            dest = os.path.join(output_dir, "video.mp4")
+        base_info = {"title": data.get("title") or "video",
+                     "duration": data.get("duration") or 0}
+
+        def try_direct() -> Optional[dict]:
+            nonlocal last_error
+            candidates = _ordered_candidates(
+                list(data.get("videoStreams") or []), max_height, "url",
+                ("quality",), exact_height=exact_height)
+            if not candidates:
+                _log(log, f"piped {api}: no direct stream at "
+                          f"{'exactly ' if exact_height else '≤'}"
+                          f"{max_height}p")
+            for s in candidates:
+                h = _candidate_height(s, ("quality",))
+                dest = os.path.join(output_dir, "video.mp4")
+                try:
+                    _download_stream(s["url"], dest, progress)
+                    _log(log, f"piped {api}: downloaded {h}p ✓")
+                    return {"path": dest, **base_info}
+                except Exception as exc:
+                    last_error = exc
+                    _log(log, f"piped {api} {h}p: {exc}")
+            return None
+
+        def try_hls() -> Optional[dict]:
+            nonlocal last_error
+            hls = data.get("hls")
+            if not hls:
+                return None
             try:
-                _download_stream(s["url"], dest, progress)
-                _log(log, f"piped {api}: downloaded {h}p ✓")
-                return {
-                    "path": dest,
-                    "title": data.get("title") or "video",
-                    "duration": data.get("duration") or 0,
-                }
+                got = _download_hls(hls, output_dir, max_height,
+                                    exact_height, progress)
+                h = measure_height(got["path"])
+                if h == 0:
+                    raise RuntimeError("HLS result not decodable")
+                if exact_height and h != max_height:
+                    raise RuntimeError(
+                        f"HLS gave {h}p, wanted {max_height}p")
+                _log(log, f"piped {api}: downloaded {h}p via HLS ✓")
+                return {**got, **base_info}
             except Exception as exc:
                 last_error = exc
-                _log(log, f"piped {api} {h}p: {exc}")
+                _log(log, f"piped {api} HLS: {str(exc).splitlines()[0][:140]}")
+                return None
+
+        # The HLS master usually carries the high qualities the direct
+        # list lacks, so it leads the relaxed round; in the strict round
+        # a direct exact stream (no remux needed) is tried first.
+        order = (try_direct, try_hls) if exact_height else (try_hls,
+                                                            try_direct)
+        for attempt in order:
+            result = attempt()
+            if result:
+                return result
     raise last_error or RuntimeError("no Piped instance available")
+
+
+def _download_hls(hls_url: str, output_dir: str, max_height: int,
+                  exact_height: bool,
+                  progress: Optional[ProgressFn]) -> dict:
+    """Download from an HLS master playlist (proxied by a mirror, so it
+    is reachable even when YouTube blocks us). The master carries ALL
+    qualities — including heights missing from the mirror's direct
+    stream list — and yt-dlp picks the right variant."""
+    def hook(d):
+        if progress and d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            done = d.get("downloaded_bytes")
+            if total and done:
+                progress(done / total,
+                         f"{done / 1e6:.0f}MB / {total / 1e6:.0f}MB")
+
+    fmt = (f"bv*[height={max_height}]/b[height={max_height}]"
+           if exact_height else "bv*/b")
+    opts = {
+        "format": fmt,
+        "format_sort": [f"res:{max_height}"],
+        "outtmpl": os.path.join(output_dir, "video.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "progress_hooks": [hook],
+        "socket_timeout": 30,
+        "concurrent_fragment_downloads": 8,
+    }
+    ffmpeg = _ffmpeg_location()
+    if ffmpeg:
+        opts["ffmpeg_location"] = os.path.dirname(ffmpeg)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(hls_url, download=True)
+        path = ydl.prepare_filename(info)
+    return {"path": _remux_mp4(path)}
+
+
+def _remux_mp4(path: str) -> str:
+    """HLS downloads arrive as raw MPEG-TS fragments even when named
+    .mp4; remux (stream copy, no re-encoding) into a real MP4 container
+    so OpenCV can decode it."""
+    ffmpeg = _ffmpeg_location()
+    if not ffmpeg:
+        return path
+    fixed = os.path.join(os.path.dirname(path), "video_remux.mp4")
+    try:
+        subprocess.run([ffmpeg, "-y", "-i", path, "-c", "copy", fixed],
+                       check=True, capture_output=True, timeout=600)
+        os.replace(fixed, path)
+    except Exception:
+        try:
+            os.remove(fixed)
+        except OSError:
+            pass
+    return path
 
 
 def _cobalt_stream_url(api: str, video_url: str, max_height: int,

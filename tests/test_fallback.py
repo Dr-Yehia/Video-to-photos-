@@ -16,6 +16,7 @@ Run:  python tests/test_fallback.py
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -28,6 +29,76 @@ from slide_extractor import downloader
 from test_extractor import build_video
 
 VIDEO_ID = "dQw4w9WgXcQ"
+
+
+def build_hls(src360: str, src720: str, out_dir: str):
+    """Real two-quality HLS: variant playlists + segments + a master
+    playlist with RESOLUTION tags, exactly like a Piped-proxied stream."""
+    import imageio_ffmpeg
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    for name, src in (("v360", src360), ("v720", src720)):
+        # Re-encode to H.264, the codec real YouTube HLS uses (the mp4v
+        # test codec crashes ffmpeg's TS demuxer when stream-copied).
+        subprocess.run(
+            [ffmpeg, "-y", "-i", src, "-c:v", "libx264",
+             "-preset", "ultrafast", "-hls_time", "4",
+             "-hls_list_size", "0",
+             "-hls_segment_filename", os.path.join(out_dir, f"{name}_%d.ts"),
+             os.path.join(out_dir, f"{name}.m3u8")],
+            check=True, capture_output=True)
+    with open(os.path.join(out_dir, "master.m3u8"), "w") as f:
+        f.write("#EXTM3U\n"
+                "#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\n"
+                "v360.m3u8\n"
+                "#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720\n"
+                "v720.m3u8\n")
+
+
+class MockPiped(BaseHTTPRequestHandler):
+    """A Piped instance whose direct list only has 360p but whose HLS
+    master carries 360p AND 720p — like real instances in production."""
+    hls_dir = ""
+    direct_bytes = b""
+
+    def do_GET(self):
+        port = self.server.server_port
+        if self.path.startswith(f"/streams/{VIDEO_ID}"):
+            body = json.dumps({
+                "title": "Mock Lecture",
+                "duration": 42,
+                "videoStreams": [
+                    {"url": f"http://127.0.0.1:{port}/direct360.mp4",
+                     "mimeType": "video/mp4", "quality": "360p"},
+                ],
+                "hls": f"http://127.0.0.1:{port}/hls/master.m3u8",
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/direct360.mp4":
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(self.direct_bytes)))
+            self.end_headers()
+            self.wfile.write(self.direct_bytes)
+        elif self.path.startswith("/hls/"):
+            fp = os.path.join(self.hls_dir, os.path.basename(self.path))
+            if os.path.isfile(fp):
+                data = open(fp, "rb").read()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self.send_response(404)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *a):
+        pass
 
 
 def upscale_video(src: str, dest: str, width: int, height: int):
@@ -214,7 +285,37 @@ def main():
     assert cap.isOpened() and cap.read()[0], "downloaded video not decodable"
     cap.release()
 
+    # 5) Piped HLS path: the direct list only offers 360p, but the HLS
+    # master carries 720p — the production scenario where high quality
+    # exists only behind the HLS playlist.
+    hls_dir = os.path.join(tmp, "hls")
+    os.makedirs(hls_dir)
+    build_hls(src360, src720, hls_dir)
+    MockPiped.hls_dir = hls_dir
+    MockPiped.direct_bytes = open(src360, "rb").read()
+    piped_server = ThreadingHTTPServer(("127.0.0.1", 0), MockPiped)
+    threading.Thread(target=piped_server.serve_forever, daemon=True).start()
+
+    downloader.INVIDIOUS_INSTANCES = []
+    downloader.COBALT_INSTANCES = []
+    downloader.PIPED_INSTANCES = [
+        f"http://127.0.0.1:{piped_server.server_port}"]
+
+    log = []
+    info = downloader.download_video(
+        url, os.path.join(tmp, "out_hls"), max_height=720,
+        exact_height=True, source_hint="piped", attempt_log=log)
+    print(f"  piped direct=360p only, HLS has 720p -> measured "
+          f"{info['actual_height']}p")
+    for line in log:
+        if "piped" in line:
+            print(f"    {line}")
+    assert info["actual_height"] == 720, info
+    assert any("HLS" in e and "✓" in e for e in log), log
+
     server.shutdown()
+    cobalt_server.shutdown()
+    piped_server.shutdown()
     print("FALLBACK CHAIN TEST PASSED ✔")
 
 

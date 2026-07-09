@@ -21,10 +21,13 @@ from slide_extractor import (ExtractorConfig, SlideExtractor, __version__,
 st.set_page_config(page_title="فيديو إلى شرائح — Video to Slides",
                    page_icon="🎬", layout="wide")
 
-# Allow configuring a download proxy via Streamlit Cloud secrets.
+# Allow configuring a download proxy and custom mirror instances via
+# Streamlit Cloud secrets (e.g. your own cobalt/Invidious server).
 try:
-    if "YTDLP_PROXY" in st.secrets:
-        os.environ["YTDLP_PROXY"] = st.secrets["YTDLP_PROXY"]
+    for _key in ("YTDLP_PROXY", "V2S_COBALT_INSTANCES",
+                 "V2S_INVIDIOUS_INSTANCES", "V2S_PIPED_INSTANCES"):
+        if _key in st.secrets:
+            os.environ[_key] = st.secrets[_key]
 except Exception:
     pass  # no secrets file configured
 
