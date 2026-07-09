@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from slide_extractor import probe_video
 from slide_extractor.jobs import JobManager
 
 app = FastAPI(title="Video to Slides", version="1.0.0")
@@ -31,6 +32,20 @@ class CreateJobRequest(BaseModel):
 
 class CustomPdfRequest(BaseModel):
     selected: list[int]
+
+
+class ProbeRequest(BaseModel):
+    url: str = Field(..., min_length=8)
+
+
+@app.post("/api/probe")
+def probe(req: ProbeRequest):
+    """Read title, duration and the REAL available qualities of a video
+    without downloading it."""
+    try:
+        return probe_video(req.url)
+    except Exception as exc:
+        raise HTTPException(502, str(exc))
 
 
 @app.post("/api/jobs")

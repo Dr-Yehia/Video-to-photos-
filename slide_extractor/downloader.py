@@ -38,18 +38,26 @@ _RETRYABLE_MARKERS = ("403", "forbidden", "po token", "not a bot",
                       "timed out", "429", "requested format is not available",
                       "no video formats", "drm")
 
-# Public mirror instances, tried in order. Tests may monkeypatch these.
-INVIDIOUS_INSTANCES: List[str] = [
+def _env_instances(var: str, default: List[str]) -> List[str]:
+    """Instance lists can be overridden (comma-separated) via env vars —
+    used by offline tests and by deployments that run their own mirror."""
+    raw = os.environ.get(var, "")
+    parsed = [s.strip().rstrip("/") for s in raw.split(",") if s.strip()]
+    return parsed or default
+
+
+# Public mirror instances, tried in order.
+INVIDIOUS_INSTANCES: List[str] = _env_instances("V2S_INVIDIOUS_INSTANCES", [
     "https://inv.nadeko.net",
     "https://yewtu.be",
     "https://invidious.nerdvpn.de",
     "https://iv.melmac.space",
-]
-PIPED_INSTANCES: List[str] = [
+])
+PIPED_INSTANCES: List[str] = _env_instances("V2S_PIPED_INSTANCES", [
     "https://pipedapi.kavin.rocks",
     "https://pipedapi.adminforge.de",
     "https://api.piped.private.coffee",
-]
+])
 
 _VIDEO_ID_RE = re.compile(
     r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})")
@@ -243,6 +251,104 @@ def _piped_download(video_id: str, output_dir: str, max_height: int,
         except Exception as exc:
             last_error = exc
     raise last_error or RuntimeError("no Piped instance available")
+
+
+# ---------------------------------------------------------------------------
+def probe_video(url: str, cookies_file: Optional[str] = None) -> dict:
+    """Read the video's metadata WITHOUT downloading it: title, duration
+    and — crucially — the list of video heights that actually exist in
+    this specific video, so the user chooses among real qualities
+    instead of assumed ones.
+
+    Returns {'title', 'duration', 'heights': [1080, 720, ...],
+             'source': 'youtube' | 'invidious' | 'piped'}.
+    """
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 20,
+    }
+    if cookies_file and os.path.isfile(cookies_file):
+        opts["cookiefile"] = cookies_file
+    proxy = os.environ.get("YTDLP_PROXY")
+    if proxy:
+        opts["proxy"] = proxy
+
+    first_error: Optional[Exception] = None
+    for clients in _CLIENT_ATTEMPTS:
+        o = dict(opts)
+        if clients:
+            o["extractor_args"] = {"youtube": {"player_client": clients}}
+        try:
+            with yt_dlp.YoutubeDL(o) as ydl:
+                info = ydl.extract_info(url, download=False)
+            heights = sorted({
+                int(f["height"]) for f in info.get("formats", [])
+                if f.get("height") and f.get("vcodec") not in (None, "none")
+                and not f.get("has_drm")
+            }, reverse=True)
+            return {
+                "title": info.get("title") or "video",
+                "duration": info.get("duration") or 0,
+                "heights": heights,
+                "source": "youtube",
+            }
+        except yt_dlp.utils.DownloadError as exc:
+            first_error = first_error or exc
+            if _retryable(str(exc)):
+                continue
+            raise
+
+    vid = _video_id(url)
+    if vid:
+        for inst in INVIDIOUS_INSTANCES:
+            try:
+                r = requests.get(
+                    f"{inst}/api/v1/videos/{vid}",
+                    params={"fields": "title,lengthSeconds,formatStreams,"
+                                      "adaptiveFormats"},
+                    timeout=15, headers={"User-Agent": _UA})
+                r.raise_for_status()
+                data = r.json()
+                streams = list(data.get("formatStreams") or [])
+                streams += [s for s in (data.get("adaptiveFormats") or [])
+                            if "video" in str(s.get("type", "")).lower()]
+                heights = sorted({
+                    h for s in streams
+                    for h in [_stream_height(str(s.get("resolution") or
+                                                 s.get("qualityLabel") or ""))]
+                    if h
+                }, reverse=True)
+                return {
+                    "title": data.get("title") or "video",
+                    "duration": data.get("lengthSeconds") or 0,
+                    "heights": heights,
+                    "source": "invidious",
+                }
+            except Exception:
+                continue
+        for api in PIPED_INSTANCES:
+            try:
+                r = requests.get(f"{api}/streams/{vid}", timeout=15,
+                                 headers={"User-Agent": _UA})
+                r.raise_for_status()
+                data = r.json()
+                heights = sorted({
+                    h for s in (data.get("videoStreams") or [])
+                    for h in [_stream_height(str(s.get("quality", "")))]
+                    if h
+                }, reverse=True)
+                return {
+                    "title": data.get("title") or "video",
+                    "duration": data.get("duration") or 0,
+                    "heights": heights,
+                    "source": "piped",
+                }
+            except Exception:
+                continue
+
+    raise first_error or RuntimeError("could not read video info")
 
 
 # ---------------------------------------------------------------------------

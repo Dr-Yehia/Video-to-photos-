@@ -4,10 +4,9 @@ Run locally:
     pip install -r requirements.txt
     streamlit run streamlit_app.py
 
-Can also be deployed for free on Streamlit Community Cloud. Note that
-YouTube frequently blocks downloads coming from cloud datacenter IPs,
-so on a hosted deployment the "upload a video file" mode is the
-reliable path; on your own machine YouTube links work normally.
+Flow for URLs: the video is PROBED first (title, duration and the list
+of qualities that actually exist in it), the user picks one of the real
+qualities, then extraction runs. Nothing is assumed about the video.
 """
 
 import os
@@ -16,7 +15,8 @@ import tempfile
 import streamlit as st
 
 from slide_extractor import (ExtractorConfig, SlideExtractor, __version__,
-                             build_pdf, build_zip, download_video)
+                             build_pdf, build_zip, download_video,
+                             probe_video)
 
 st.set_page_config(page_title="فيديو إلى شرائح — Video to Slides",
                    page_icon="🎬", layout="wide")
@@ -53,33 +53,35 @@ SENSITIVITY_LABELS = {
     "عالية — يلتقط تغييرات أدق": "high",
 }
 
-with st.form("input_form"):
-    url = st.text_input("🔗 رابط الفيديو",
-                        placeholder="https://www.youtube.com/watch?v=...")
-    uploaded = st.file_uploader("📁 أو ارفع ملف فيديو من جهازك",
-                                type=["mp4", "webm", "mkv", "avi", "mov"])
-    col1, col2 = st.columns(2)
-    with col1:
-        sens_label = st.selectbox("دقة الاستخراج",
-                                  list(SENSITIVITY_LABELS), index=1)
-    with col2:
-        quality = st.selectbox("جودة تحميل الفيديو", [720, 1080], index=1,
-                               format_func=lambda q: f"{q}p")
-    with st.expander("⚙️ خيارات متقدمة — إذا رفض يوتيوب التحميل من الخادم"):
-        st.markdown(
-            "يوتيوب يحجب أحياناً التحميل من خوادم السحابة. التطبيق يجرّب "
-            "تلقائياً 6 عملاء مختلفين ثم شبكات المرايا (Invidious/Piped)، "
-            "وإذا استمر الرفض:\n"
-            "- ارفع ملف `cookies.txt` من متصفحك (عبر إضافة مثل "
-            "*Get cookies.txt LOCALLY*) ليتم التحميل بحسابك — الحل الأقوى.\n"
-            "- أو أضف بروكسي في إعدادات التطبيق (Secrets): "
-            "`YTDLP_PROXY = \"http://user:pass@host:port\"` — "
-            "بروكسي منزلي/سكني يجعل النجاح شبه مضمون."
+
+def show_download_error(exc: Exception):
+    msg = str(exc)
+    low = msg.lower()
+    if "drm" in low:
+        st.error(
+            "🔐 أبلغ يوتيوب أن هذه النسخة محمية (DRM) — غالباً بلاغ خاطئ "
+            "يحدث مع بعض الخوادم السحابية رغم أن الفيديو عادي. الحلول:\n\n"
+            "1. **ارفع ملف cookies.txt** من \"الخيارات المتقدمة\".\n"
+            "2. **شغّل التطبيق على جهازك** — يعمل مباشرة.\n"
+            "3. **ارفع ملف الفيديو مباشرة** بدل الرابط."
         )
-        cookies_upload = st.file_uploader("ملف cookies.txt (اختياري)",
-                                          type=["txt"])
-    submitted = st.form_submit_button("🚀 استخراج الشرائح",
-                                      use_container_width=True)
+    elif "403" in low or "forbidden" in low:
+        st.error(
+            "🚫 يوتيوب يحجب التحميل من عنوان هذا الخادم السحابي (خطأ 403) "
+            "رغم تجربة عدة طرق تلقائياً. الحلول:\n\n"
+            "1. **شغّل التطبيق على جهازك** — يعمل مباشرة بدون أي مشكلة.\n"
+            "2. **ارفع ملف cookies.txt** من \"الخيارات المتقدمة\".\n"
+            "3. **ارفع ملف الفيديو مباشرة** بدل الرابط."
+        )
+    elif any(k in low for k in ("proxy", "unable to connect", "timed out",
+                                "getaddrinfo")):
+        st.error("تعذر الوصول إلى يوتيوب من هذا الخادم — جرّب من شبكة أخرى "
+                 "أو ارفع ملف الفيديو مباشرة.")
+    else:
+        st.error(f"فشل التنفيذ: {msg}")
+        return
+    with st.expander("التفاصيل التقنية"):
+        st.code(msg)
 
 
 def run_pipeline(video_path: str, sensitivity: str, workdir: str,
@@ -111,79 +113,122 @@ def run_pipeline(video_path: str, sensitivity: str, workdir: str,
     }
 
 
-if submitted:
-    st.session_state.pop("result", None)
-    try:
-        workdir = tempfile.mkdtemp(prefix="v2s_")
-        if uploaded is not None:
+def save_cookies(upload, workdir: str):
+    if upload is None:
+        return None
+    path = os.path.join(workdir, "cookies.txt")
+    with open(path, "wb") as f:
+        f.write(upload.getbuffer())
+    return path
+
+
+sens_label = st.selectbox("دقة الاستخراج", list(SENSITIVITY_LABELS), index=1)
+sensitivity = SENSITIVITY_LABELS[sens_label]
+
+tab_url, tab_file = st.tabs(["🔗 رابط يوتيوب", "📁 رفع ملف من جهازك"])
+
+# ---------------------------------------------------------------- URL tab
+with tab_url:
+    url = st.text_input("رابط الفيديو",
+                        placeholder="https://www.youtube.com/watch?v=...")
+    with st.expander("⚙️ خيارات متقدمة — إذا رفض يوتيوب التحميل من الخادم"):
+        st.markdown(
+            "يوتيوب يحجب أحياناً التحميل من خوادم السحابة. التطبيق يجرّب "
+            "تلقائياً 6 عملاء مختلفين ثم شبكات المرايا (Invidious/Piped)، "
+            "وإذا استمر الرفض:\n"
+            "- ارفع ملف `cookies.txt` من متصفحك (عبر إضافة مثل "
+            "*Get cookies.txt LOCALLY*) ليتم التحميل بحسابك — الحل الأقوى.\n"
+            "- أو أضف بروكسي في إعدادات التطبيق (Secrets): "
+            "`YTDLP_PROXY = \"http://user:pass@host:port\"`."
+        )
+        cookies_upload = st.file_uploader("ملف cookies.txt (اختياري)",
+                                          type=["txt"])
+
+    if st.button("🔍 فحص الفيديو ومعرفة الجودات المتاحة",
+                 use_container_width=True):
+        if not url.strip():
+            st.error("أدخل رابط الفيديو أولاً.")
+        else:
+            st.session_state.pop("result", None)
+            st.session_state.pop("probe", None)
+            try:
+                workdir = tempfile.mkdtemp(prefix="v2s_")
+                cookies_path = save_cookies(cookies_upload, workdir)
+                with st.spinner("جارٍ قراءة معلومات الفيديو وجوداته الحقيقية…"):
+                    probe = probe_video(url.strip(),
+                                        cookies_file=cookies_path)
+                st.session_state["probe"] = probe
+                st.session_state["probe_url"] = url.strip()
+                st.session_state["probe_workdir"] = workdir
+                st.session_state["probe_cookies"] = cookies_path
+            except Exception as exc:
+                show_download_error(exc)
+
+    probe = st.session_state.get("probe")
+    if probe and st.session_state.get("probe_url") == url.strip():
+        mins, secs = divmod(int(probe["duration"] or 0), 60)
+        dur = f"{mins}:{secs:02d}" if probe["duration"] else "غير معروفة"
+        st.success(f"🎥 **{probe['title']}** — المدة: {dur}")
+
+        if probe["heights"]:
+            labels = [f"{h}p" for h in probe["heights"]]
+            st.markdown("**الجودات المتاحة فعلياً في هذا الفيديو:** "
+                        + " · ".join(labels))
+            choice = st.selectbox("اختر الجودة", labels, index=0)
+            chosen_height = int(choice.rstrip("p"))
+        else:
+            st.info("تعذرت قراءة قائمة الجودات — سيتم تحميل أفضل جودة "
+                    "متاحة تلقائياً.")
+            chosen_height = 4320  # i.e. no cap: best the video offers
+
+        if st.button("🚀 استخراج الشرائح", type="primary",
+                     use_container_width=True):
+            st.session_state.pop("result", None)
+            try:
+                workdir = st.session_state["probe_workdir"]
+                bar = st.progress(0.0, text="⬇️ جارٍ تحميل الفيديو…")
+
+                def dl_progress(p, msg):
+                    label = ("⬇️ جارٍ التحميل عبر المرايا… "
+                             if "mirror" in msg else "⬇️ جارٍ التحميل… ")
+                    bar.progress(min(p, 1.0), text=f"{label}{p * 100:.0f}%")
+
+                info = download_video(
+                    url.strip(), workdir, max_height=chosen_height,
+                    progress=dl_progress,
+                    cookies_file=st.session_state.get("probe_cookies"))
+                bar.empty()
+                st.session_state["result"] = run_pipeline(
+                    info["path"], sensitivity, workdir, info["title"])
+            except Exception as exc:
+                show_download_error(exc)
+
+# --------------------------------------------------------------- File tab
+with tab_file:
+    uploaded = st.file_uploader(
+        "ملف الفيديو (بدون حد عملي للحجم — حتى 4GB)",
+        type=["mp4", "webm", "mkv", "avi", "mov"])
+    if uploaded is not None and st.button("🚀 استخراج الشرائح من الملف",
+                                          type="primary",
+                                          use_container_width=True):
+        st.session_state.pop("result", None)
+        try:
+            workdir = tempfile.mkdtemp(prefix="v2s_")
             video_path = os.path.join(workdir, uploaded.name)
             with open(video_path, "wb") as f:
                 f.write(uploaded.getbuffer())
             title = os.path.splitext(uploaded.name)[0]
-        elif url.strip():
-            bar = st.progress(0.0, text="⬇️ جارٍ تحميل الفيديو من يوتيوب…")
+            st.session_state["result"] = run_pipeline(
+                video_path, sensitivity, workdir, title)
+        except Exception as exc:
+            show_download_error(exc)
 
-            def dl_progress(p, msg):
-                bar.progress(min(p, 1.0),
-                             text=f"⬇️ جارٍ التحميل… {p * 100:.0f}%")
-
-            cookies_path = None
-            if cookies_upload is not None:
-                cookies_path = os.path.join(workdir, "cookies.txt")
-                with open(cookies_path, "wb") as f:
-                    f.write(cookies_upload.getbuffer())
-
-            info = download_video(url.strip(), workdir,
-                                  max_height=int(quality),
-                                  progress=dl_progress,
-                                  cookies_file=cookies_path)
-            bar.empty()
-            video_path, title = info["path"], info["title"]
-        else:
-            st.error("أدخل رابط فيديو أو ارفع ملفاً أولاً.")
-            st.stop()
-
-        st.session_state["result"] = run_pipeline(
-            video_path, SENSITIVITY_LABELS[sens_label], workdir, title)
-    except Exception as exc:
-        msg = str(exc)
-        low = msg.lower()
-        if "drm" in low:
-            st.error(
-                "🔐 أبلغ يوتيوب أن هذه النسخة محمية (DRM) — غالباً بلاغ خاطئ "
-                "يحدث مع بعض الخوادم السحابية رغم أن الفيديو عادي. الحلول:\n\n"
-                "1. **ارفع ملف cookies.txt** من \"الخيارات المتقدمة\" أعلاه.\n"
-                "2. **شغّل التطبيق على جهازك** — يعمل مباشرة.\n"
-                "3. **ارفع ملف الفيديو مباشرة** بدل الرابط."
-            )
-            with st.expander("التفاصيل التقنية"):
-                st.code(msg)
-        elif "403" in low or "forbidden" in low:
-            st.error(
-                "🚫 يوتيوب يحجب التحميل من عنوان هذا الخادم السحابي (خطأ 403) "
-                "رغم تجربة عدة طرق تلقائياً. الحلول:\n\n"
-                "1. **شغّل التطبيق على جهازك** — يعمل مباشرة بدون أي مشكلة.\n"
-                "2. **ارفع ملف cookies.txt** من \"الخيارات المتقدمة\" أعلاه.\n"
-                "3. **ارفع ملف الفيديو مباشرة** بدل الرابط (حمّله على جهازك "
-                "أولاً ثم ارفعه هنا)."
-            )
-            with st.expander("التفاصيل التقنية"):
-                st.code(msg)
-        elif any(k in low for k in ("proxy", "unable to connect",
-                                    "timed out", "getaddrinfo")):
-            st.error("تعذر الوصول إلى يوتيوب من هذا الخادم — جرّب من شبكة "
-                     "أخرى أو ارفع ملف الفيديو مباشرة.")
-            with st.expander("التفاصيل التقنية"):
-                st.code(msg)
-        else:
-            st.error(f"فشل الاستخراج: {msg}")
-
+# ----------------------------------------------------------------- Results
 result = st.session_state.get("result")
 if result:
     slides = result["slides"]
     st.success(f"✅ تم استخراج {len(slides)} شريحة من: {result['title']}")
 
-    # Selection state survives reruns via the checkbox keys
     st.markdown("### الشرائح المستخرجة — ألغِ تحديد ما لا تريده في الـ PDF")
     cols_per_row = 4
     for row_start in range(0, len(slides), cols_per_row):

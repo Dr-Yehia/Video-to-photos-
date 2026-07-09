@@ -8,15 +8,16 @@ Open-source building blocks:
 """
 
 from .extractor import SlideExtractor, ExtractorConfig, Slide
-from .downloader import download_video
+from .downloader import download_video, probe_video
 from .pdf_builder import build_pdf, build_zip
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 __all__ = [
     "SlideExtractor",
     "ExtractorConfig",
     "Slide",
     "download_video",
+    "probe_video",
     "build_pdf",
     "build_zip",
 ]

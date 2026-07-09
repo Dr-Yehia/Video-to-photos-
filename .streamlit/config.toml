@@ -1,0 +1,3 @@
+# Raise the upload limit (MB): full movies are fine, not just clips.
+[server]
+maxUploadSize = 4096

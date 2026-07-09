@@ -81,6 +81,14 @@ def main():
     downloader.INVIDIOUS_INSTANCES = [f"http://127.0.0.1:{port}"]
     downloader.PIPED_INSTANCES = []
 
+    # probe_video must fall back to the mirror too and report the REAL
+    # qualities present in the video (the mock offers only 360p).
+    probe = downloader.probe_video(f"https://youtu.be/{VIDEO_ID}")
+    print(f"  probe    : {probe}")
+    assert probe["title"] == "Mock Lecture"
+    assert probe["heights"] == [360]
+    assert probe["source"] == "invidious"
+
     events = []
     info = downloader.download_video(
         f"https://youtu.be/{VIDEO_ID}", os.path.join(tmp, "out"),
