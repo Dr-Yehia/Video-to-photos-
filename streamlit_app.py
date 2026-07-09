@@ -17,6 +17,11 @@ import streamlit as st
 from slide_extractor import (ExtractorConfig, SlideExtractor, __version__,
                              build_pdf, build_zip, download_video,
                              probe_video)
+from slide_extractor.pot_server import ensure_pot_server
+
+# Start the PO-token server (unlocks >360p qualities); runs npm install
+# in the background on the very first boot, no-op afterwards.
+ensure_pot_server()
 
 st.set_page_config(page_title="فيديو إلى شرائح — Video to Slides",
                    page_icon="🎬", layout="wide")

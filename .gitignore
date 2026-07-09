@@ -8,3 +8,4 @@ slides_output/
 .venv/
 venv/
 nohup.out
+vendor/pot-server/node_modules/

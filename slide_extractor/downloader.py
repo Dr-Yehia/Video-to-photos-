@@ -422,6 +422,7 @@ def _piped_download(video_id: str, output_dir: str, max_height: int,
             nonlocal last_error
             hls = data.get("hls")
             if not hls:
+                _log(log, f"piped {api}: no HLS playlist in response")
                 return None
             try:
                 got = _download_hls(hls, output_dir, max_height,
@@ -704,6 +705,15 @@ def download_video(
     attempt_log, if given, collects a human-readable line per attempt.
     """
     os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        from .pot_server import pot_server_alive
+        _log(attempt_log,
+             "PO-token server: " +
+             ("running ✓ (>360p unlocked)" if pot_server_alive()
+              else "not running — YouTube caps most channels at 360p"))
+    except Exception:
+        pass
 
     def _finish(info: dict) -> dict:
         info["actual_height"] = measure_height(info["path"])
