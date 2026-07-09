@@ -46,18 +46,66 @@ def _env_instances(var: str, default: List[str]) -> List[str]:
     return parsed or default
 
 
-# Public mirror instances, tried in order.
+# Static fallback mirror instances (public instances rot quickly, so
+# the live registries below are consulted first).
 INVIDIOUS_INSTANCES: List[str] = _env_instances("V2S_INVIDIOUS_INSTANCES", [
     "https://inv.nadeko.net",
     "https://yewtu.be",
     "https://invidious.nerdvpn.de",
-    "https://iv.melmac.space",
 ])
 PIPED_INSTANCES: List[str] = _env_instances("V2S_PIPED_INSTANCES", [
     "https://pipedapi.kavin.rocks",
-    "https://pipedapi.adminforge.de",
     "https://api.piped.private.coffee",
 ])
+
+# Live instance discovery from the official registries: public mirrors
+# die weekly, so a hardcoded list alone guarantees eventual failure.
+# Disabled in offline tests via V2S_DISCOVER=0.
+DISCOVER_INSTANCES = os.environ.get("V2S_DISCOVER", "1") != "0"
+_REGISTRY_CACHE: dict = {}
+
+
+def _discover_instances(kind: str) -> List[str]:
+    if not DISCOVER_INSTANCES:
+        return []
+    if kind in _REGISTRY_CACHE:
+        return _REGISTRY_CACHE[kind]
+    found: List[str] = []
+    try:
+        if kind == "invidious":
+            r = requests.get("https://api.invidious.io/instances.json",
+                             params={"sort_by": "health"}, timeout=10,
+                             headers={"User-Agent": _UA})
+            r.raise_for_status()
+            for _name, info in r.json():
+                if info.get("type") == "https" and info.get("api") is not False:
+                    uri = str(info.get("uri", "")).rstrip("/")
+                    if uri.startswith("https://"):
+                        found.append(uri)
+        else:
+            r = requests.get("https://piped-instances.kavin.rocks/",
+                             timeout=10, headers={"User-Agent": _UA})
+            r.raise_for_status()
+            for inst in r.json():
+                api_url = str(inst.get("api_url", "")).rstrip("/")
+                if api_url.startswith("https://"):
+                    found.append(api_url)
+    except Exception:
+        found = []
+    _REGISTRY_CACHE[kind] = found[:8]  # healthiest few; keep runtime sane
+    return _REGISTRY_CACHE[kind]
+
+
+def _mirror_instances(kind: str) -> List[str]:
+    """Live registry instances first (healthiest), the static list as a
+    backup, de-duplicated preserving order."""
+    static = INVIDIOUS_INSTANCES if kind == "invidious" else PIPED_INSTANCES
+    seen, merged = set(), []
+    for inst in _discover_instances(kind) + static:
+        if inst not in seen:
+            seen.add(inst)
+            merged.append(inst)
+    return merged
 
 _VIDEO_ID_RE = re.compile(
     r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})")
@@ -234,7 +282,7 @@ def _invidious_download(video_id: str, output_dir: str, max_height: int,
                         exact_height: bool = False,
                         log: Optional[list] = None) -> dict:
     last_error: Optional[Exception] = None
-    for inst in INVIDIOUS_INSTANCES:
+    for inst in _mirror_instances("invidious"):
         try:
             r = requests.get(
                 f"{inst}/api/v1/videos/{video_id}",
@@ -283,7 +331,7 @@ def _piped_download(video_id: str, output_dir: str, max_height: int,
                     exact_height: bool = False,
                     log: Optional[list] = None) -> dict:
     last_error: Optional[Exception] = None
-    for api in PIPED_INSTANCES:
+    for api in _mirror_instances("piped"):
         try:
             r = requests.get(f"{api}/streams/{video_id}", timeout=15,
                              headers={"User-Agent": _UA})
@@ -365,7 +413,7 @@ def probe_video(url: str, cookies_file: Optional[str] = None) -> dict:
 
     vid = _video_id(url)
     if vid:
-        for inst in INVIDIOUS_INSTANCES:
+        for inst in _mirror_instances("invidious"):
             try:
                 r = requests.get(
                     f"{inst}/api/v1/videos/{vid}",
@@ -391,7 +439,7 @@ def probe_video(url: str, cookies_file: Optional[str] = None) -> dict:
                 }
             except Exception:
                 continue
-        for api in PIPED_INSTANCES:
+        for api in _mirror_instances("piped"):
             try:
                 r = requests.get(f"{api}/streams/{vid}", timeout=15,
                                  headers={"User-Agent": _UA})

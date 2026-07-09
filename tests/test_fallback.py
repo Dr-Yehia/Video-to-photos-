@@ -121,6 +121,8 @@ def main():
 
     # Point the mirror layer at the mock; leave yt-dlp pointing at the
     # real (unreachable) YouTube so the primary layer genuinely fails.
+    # Live registry discovery is disabled so only the mock is consulted.
+    downloader.DISCOVER_INSTANCES = False
     downloader.INVIDIOUS_INSTANCES = [f"http://127.0.0.1:{port}"]
     downloader.PIPED_INSTANCES = []
     url = f"https://youtu.be/{VIDEO_ID}"
