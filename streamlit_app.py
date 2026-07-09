@@ -15,8 +15,8 @@ import tempfile
 
 import streamlit as st
 
-from slide_extractor import (ExtractorConfig, SlideExtractor, build_pdf,
-                             build_zip, download_video)
+from slide_extractor import (ExtractorConfig, SlideExtractor, __version__,
+                             build_pdf, build_zip, download_video)
 
 st.set_page_config(page_title="فيديو إلى شرائح — Video to Slides",
                    page_icon="🎬", layout="wide")
@@ -201,5 +201,5 @@ if result:
                                use_container_width=True)
 
 st.divider()
-st.caption("مبني بمكتبات مفتوحة المصدر: yt-dlp · OpenCV · ImageHash · "
-           "img2pdf · Streamlit")
+st.caption(f"الإصدار {__version__} — مبني بمكتبات مفتوحة المصدر: yt-dlp · "
+           "OpenCV · ImageHash · img2pdf · Streamlit")
