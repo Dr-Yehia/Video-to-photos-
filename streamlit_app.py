@@ -257,8 +257,12 @@ with tab_file:
         try:
             workdir = tempfile.mkdtemp(prefix="v2s_")
             video_path = os.path.join(workdir, uploaded.name)
+            # Chunked copy: a movie-sized upload must not be duplicated
+            # in RAM on small cloud containers.
+            import shutil as _shutil
+            uploaded.seek(0)
             with open(video_path, "wb") as f:
-                f.write(uploaded.getbuffer())
+                _shutil.copyfileobj(uploaded, f, length=4 << 20)
             title = os.path.splitext(uploaded.name)[0]
             st.session_state["result"] = run_pipeline(
                 video_path, sensitivity, workdir, title)

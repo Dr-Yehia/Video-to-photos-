@@ -11,7 +11,7 @@ from .extractor import SlideExtractor, ExtractorConfig, Slide
 from .downloader import download_video, probe_video
 from .pdf_builder import build_pdf, build_zip
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __all__ = [
     "SlideExtractor",
     "ExtractorConfig",

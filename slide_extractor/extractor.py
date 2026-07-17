@@ -25,6 +25,9 @@ asymmetry between writing and page flips:
 from __future__ import annotations
 
 import os
+import re
+import shutil
+import subprocess
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
@@ -110,6 +113,99 @@ class SlideExtractor:
         cfg = self.config
         os.makedirs(output_dir, exist_ok=True)
 
+        # OpenCV's bundled decoder can't handle every codec (notably the
+        # AV1 that YouTube uses for long/low-bitrate videos). In that
+        # case re-sample the video with the bundled ffmpeg — extracting
+        # only 1 frame per analysis interval, which turns hours of
+        # transcoding into minutes and is exactly what the analysis
+        # needs anyway.
+        resampled: Optional[str] = None
+        if not self._decodable(video_path):
+            resampled = self._ffmpeg_resample(video_path, output_dir,
+                                              progress)
+            video_path = resampled
+        try:
+            return self._extract_impl(video_path, output_dir, progress)
+        finally:
+            if resampled:
+                try:
+                    os.remove(resampled)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _decodable(video_path: str) -> bool:
+        """True when OpenCV can actually DECODE frames (isOpened alone
+        lies: grab() demuxes fine while retrieve() fails on unsupported
+        codecs, which used to end analysis instantly with zero slides)."""
+        cap = cv2.VideoCapture(video_path)
+        try:
+            if not cap.isOpened():
+                return False
+            ok, frame = cap.read()
+            return bool(ok and frame is not None)
+        finally:
+            cap.release()
+
+    _TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+    _DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+    def _ffmpeg_resample(self, video_path: str, output_dir: str,
+                         progress: Optional[ProgressFn]) -> str:
+        """Re-encode to H.264 at 1 frame per sample interval (original
+        resolution, no audio) so any codec becomes analyzable."""
+        try:
+            import imageio_ffmpeg
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            raise RuntimeError(
+                "video codec unsupported by OpenCV and ffmpeg is not "
+                "available for conversion")
+        fps = 1.0 / self.config.sample_interval
+        dest = os.path.join(output_dir, "_resampled.mp4")
+        proc = subprocess.Popen(
+            [exe, "-y", "-i", video_path, "-vf", f"fps={fps}",
+             "-an", "-sn", "-c:v", "libx264", "-preset", "ultrafast",
+             "-crf", "20", dest],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            errors="replace")
+        duration = 0.0
+        buf = ""
+        while True:
+            chunk = proc.stderr.read(256)
+            if not chunk:
+                break
+            buf += chunk
+            if not duration:
+                m = self._DURATION_RE.search(buf)
+                if m:
+                    h, mnt, s = m.groups()
+                    duration = int(h) * 3600 + int(mnt) * 60 + float(s)
+            for m in self._TIME_RE.finditer(buf):
+                h, mnt, s = m.groups()
+                t = int(h) * 3600 + int(mnt) * 60 + float(s)
+                if progress and duration:
+                    progress(min(t / duration, 1.0),
+                             "converting unsupported codec")
+            buf = buf[-256:]
+        proc.wait()
+        if proc.returncode != 0 or not os.path.isfile(dest) \
+                or os.path.getsize(dest) < 1000 \
+                or not self._decodable(dest):
+            raise RuntimeError(
+                "تعذر فك ترميز الفيديو — الملف تالف أو بترميز غير مدعوم "
+                "(could not decode this video even after conversion)")
+        return dest
+
+    # ------------------------------------------------------------------
+    def _extract_impl(
+        self,
+        video_path: str,
+        output_dir: str,
+        progress: Optional[ProgressFn] = None,
+    ) -> List[Slide]:
+        cfg = self.config
+
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise RuntimeError(f"could not open video: {video_path}")
@@ -126,7 +222,13 @@ class SlideExtractor:
         seg_last: Optional[Tuple[np.ndarray, float]] = None    # newest frame
         seg_stable: Optional[Tuple[np.ndarray, float]] = None  # newest STABLE frame
 
-        raw_slides: List[Tuple[np.ndarray, float]] = []
+        # Candidate slides are spooled to disk immediately: an hours-long
+        # lecture can produce hundreds of full-resolution candidates,
+        # which must not accumulate in RAM (small cloud containers get
+        # OOM-killed otherwise).
+        raw_dir = os.path.join(output_dir, ".raw")
+        os.makedirs(raw_dir, exist_ok=True)
+        raw_slides: List[Tuple[str, float]] = []   # (jpeg path, timestamp)
 
         def close_segment():
             # Prefer the last stable frame (clean, fully rendered); fall
@@ -134,7 +236,12 @@ class SlideExtractor:
             if seg_len >= cfg.min_stable_samples:
                 pick = seg_stable or seg_last
                 if pick is not None:
-                    raw_slides.append(pick)
+                    frame, ts = pick
+                    path = os.path.join(raw_dir,
+                                        f"raw_{len(raw_slides):05d}.jpg")
+                    cv2.imwrite(path, frame,
+                                [cv2.IMWRITE_JPEG_QUALITY, cfg.jpeg_quality])
+                    raw_slides.append((path, ts))
 
         frame_idx = 0
         while True:
@@ -233,11 +340,16 @@ class SlideExtractor:
         return cv2.resize(frame, (16, 16)).astype(np.float32)
 
     # ------------------------------------------------------------------
-    def _dedup_and_save(self, raw: List[Tuple[np.ndarray, float]],
+    def _dedup_and_save(self, raw: List[Tuple[str, float]],
                         output_dir: str) -> List[Slide]:
+        """Frames are read back from disk one at a time — memory stays
+        flat no matter how many candidates an hours-long video yields."""
         cfg = self.config
         kept: List[Slide] = []
-        for frame, ts in raw:
+        for raw_path, ts in raw:
+            frame = cv2.imread(raw_path)
+            if frame is None:
+                continue
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             ph = imagehash.phash(Image.fromarray(rgb))
             sig = self._color_signature(frame)
@@ -254,7 +366,7 @@ class SlideExtractor:
             if duplicate_of is None:
                 slide = Slide(index=len(kept), timestamp=ts, path="",
                               detail_score=score, phash=ph)
-                slide._frame, slide._sig = frame, sig
+                slide._raw_path, slide._sig = raw_path, sig
                 kept.append(slide)
             elif score > duplicate_of.detail_score:
                 # Same slide seen again but with MORE content on it
@@ -263,12 +375,12 @@ class SlideExtractor:
                 duplicate_of.detail_score = score
                 duplicate_of.timestamp = ts
                 duplicate_of.phash = ph
-                duplicate_of._frame, duplicate_of._sig = frame, sig
+                duplicate_of._raw_path, duplicate_of._sig = raw_path, sig
 
         for slide in kept:
             slide.path = os.path.join(output_dir,
                                       f"slide_{slide.index + 1:03d}.jpg")
-            cv2.imwrite(slide.path, slide._frame,
-                        [cv2.IMWRITE_JPEG_QUALITY, cfg.jpeg_quality])
-            del slide._frame, slide._sig
+            os.replace(slide._raw_path, slide.path)  # already q95 JPEG
+            del slide._raw_path, slide._sig
+        shutil.rmtree(os.path.join(output_dir, ".raw"), ignore_errors=True)
         return kept
