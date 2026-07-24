@@ -52,6 +52,25 @@ _CLIENT_ATTEMPTS = (
 # format list.
 _FORMATS_ARG = ["missing_pot"]
 
+# Remote components let yt-dlp fetch YouTube's current challenge-solving
+# JS; without them a runtime alone may still fail on new challenges.
+_REMOTE_COMPONENTS = ["ejs:npm", "ejs:github"]
+
+
+def _js_opts() -> dict:
+    """yt-dlp options that make ciphered YouTube formats decodable."""
+    from .jsruntime import js_runtimes
+    runtimes, _status = js_runtimes()
+    if not runtimes:
+        return {}
+    return {"js_runtimes": runtimes,
+            "remote_components": _REMOTE_COMPONENTS}
+
+
+def js_runtime_status() -> str:
+    from .jsruntime import js_runtimes
+    return js_runtimes()[1]
+
 
 class _WarningCollector:
     """Captures yt-dlp's own warnings. They are the ONLY place that
@@ -263,6 +282,7 @@ def _ytdlp_download(url: str, output_dir: str, max_height: int,
         "socket_timeout": 20,
         # Fragmented (DASH/HLS) downloads go much faster in parallel.
         "concurrent_fragment_downloads": 4,
+        **_js_opts(),
     }
     ffmpeg = _ffmpeg_location()
     if ffmpeg:
@@ -543,6 +563,7 @@ def _download_hls(hls_url: str, output_dir: str, max_height: int,
         "progress_hooks": [hook],
         "socket_timeout": 30,
         "concurrent_fragment_downloads": 8,
+        **_js_opts(),
     }
     ffmpeg = _ffmpeg_location()
     if ffmpeg:
@@ -657,6 +678,7 @@ def probe_video(url: str, cookies_file: Optional[str] = None) -> dict:
         # for. ffmpeg_location matters because the default selector
         # wants to merge video+audio.
         "ignore_no_formats_error": True,
+        **_js_opts(),
     }
     ffmpeg = _ffmpeg_location()
     if ffmpeg:
@@ -804,6 +826,10 @@ def download_video(
     """
     os.makedirs(output_dir, exist_ok=True)
 
+    # The JS runtime decides whether YouTube's ciphered formats can be
+    # decoded at all — without it the format list is empty and every
+    # download fails with "Requested format is not available".
+    _log(attempt_log, f"JS runtime: {js_runtime_status()}")
     try:
         from .pot_server import pot_server_alive
         _log(attempt_log,

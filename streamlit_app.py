@@ -17,6 +17,7 @@ import os
 import streamlit as st
 
 from slide_extractor import __version__, build_pdf, probe_video
+from slide_extractor.downloader import js_runtime_status
 from slide_extractor.jobs import JobManager
 from slide_extractor.pot_server import ensure_pot_server
 
@@ -328,13 +329,13 @@ def render_inputs():
                         "متاحة تلقائياً.")
                 diag = probe.get("diagnostics") or []
                 fmts = probe.get("formats_count")
-                if diag or fmts is not None:
-                    with st.expander("لماذا لم تظهر الجودات؟ (تفاصيل تقنية)"):
-                        if fmts is not None:
-                            st.write(f"عدد الصيغ التي أعادها يوتيوب: "
-                                     f"**{fmts}** — صالحة للفيديو: **0**")
-                        if diag:
-                            st.code("\n".join(diag[-25:]))
+                with st.expander("لماذا لم تظهر الجودات؟ (تفاصيل تقنية)"):
+                    st.write(f"محرك جافاسكربت: **{js_runtime_status()}**")
+                    if fmts is not None:
+                        st.write(f"عدد الصيغ التي أعادها يوتيوب: "
+                                 f"**{fmts}** — صالحة للفيديو: **0**")
+                    if diag:
+                        st.code("\n".join(diag[-25:]))
                 chosen_height = 4320
                 exact = False
 

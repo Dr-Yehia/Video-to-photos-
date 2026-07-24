@@ -69,9 +69,10 @@ def _launch() -> str:
 
 
 def ensure_pot_server(background: bool = True) -> None:
-    """Start the PO token server if possible. With background=True the
-    (potentially slow) first-time npm install runs in a daemon thread so
-    the app UI is never blocked."""
+    """Start the PO token server if possible, and make sure a JS runtime
+    exists. With background=True the potentially slow first-time work
+    (npm install, Deno download) runs in a daemon thread so the app UI
+    is never blocked."""
     global _started
     with _lock:
         if _started:
@@ -79,6 +80,13 @@ def ensure_pot_server(background: bool = True) -> None:
         _started = True
 
     def work():
+        # Warm the JS runtime first: without it yt-dlp cannot decode
+        # YouTube's ciphered formats at all.
+        try:
+            from .jsruntime import js_runtimes
+            js_runtimes()
+        except Exception:
+            pass
         if not pot_server_alive():
             _launch()
 
