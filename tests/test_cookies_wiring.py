@@ -1,0 +1,89 @@
+"""Verify the cookies.txt path end-to-end, without any network.
+
+Two things must hold for cookies to actually help on a blocked host:
+  1. the file parses as a Netscape cookie jar and carries YouTube's
+     authentication cookies (SID / __Secure-*PSID / LOGIN_INFO);
+  2. the path is threaded all the way from the UI through JobManager
+     into download_video (and on to yt-dlp's `cookiefile`).
+
+Point 2 always runs. Point 1 runs when a real cookie file is supplied:
+    V2S_TEST_COOKIES=/path/to/cookies.txt python tests/test_cookies_wiring.py
+(The cookie file itself is authentication material and never belongs in
+the repository.)
+"""
+
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from slide_extractor import downloader
+from slide_extractor.jobs import JobManager
+
+AUTH_COOKIES = {"SID", "__Secure-1PSID", "__Secure-3PSID", "LOGIN_INFO",
+                "SAPISID"}
+
+
+def check_cookie_file(path: str):
+    """Parse with yt-dlp's own loader — exactly what the download will do."""
+    from yt_dlp.cookies import load_cookies
+    jar = load_cookies(path, None, None)
+    names = {c.name for c in jar if c.domain.endswith("youtube.com")}
+    print(f"  cookies for youtube.com: {len(names)}")
+    missing = AUTH_COOKIES - names
+    assert not missing, f"missing authentication cookies: {sorted(missing)}"
+    print(f"  authentication cookies present: {sorted(AUTH_COOKIES)}")
+
+
+def check_wiring():
+    """JobManager must forward cookies_file (and the quality/source
+    hints) into download_video."""
+    captured = {}
+
+    def fake_download(url, output_dir, **kwargs):
+        captured.update(kwargs)
+        captured["url"] = url
+        raise RuntimeError("stop here: wiring captured")
+
+    real = downloader.download_video
+    import slide_extractor.jobs as jobs_mod
+    jobs_mod.download_video = fake_download
+    try:
+        root = tempfile.mkdtemp(prefix="cookies_wiring_")
+        manager = JobManager(root=root)
+        job = manager.create("https://youtu.be/xxxxxxxxxxx",
+                             sensitivity="high", max_height=1080,
+                             exact_height=True, source_hint="piped",
+                             cookies_file="/tmp/my_cookies.txt")
+        for _ in range(100):
+            if job.status == "error":
+                break
+            import time
+            time.sleep(0.05)
+    finally:
+        jobs_mod.download_video = real
+
+    print(f"  forwarded: {sorted(captured)}")
+    assert captured.get("cookies_file") == "/tmp/my_cookies.txt", captured
+    assert captured.get("max_height") == 1080, captured
+    assert captured.get("exact_height") is True, captured
+    assert captured.get("source_hint") == "piped", captured
+    assert captured.get("attempt_log") is not None, captured
+
+
+def main():
+    print("wiring (UI -> JobManager -> download_video):")
+    check_wiring()
+
+    path = os.environ.get("V2S_TEST_COOKIES")
+    if path and os.path.isfile(path):
+        print("cookie file:")
+        check_cookie_file(path)
+    else:
+        print("cookie file: skipped (set V2S_TEST_COOKIES to check one)")
+
+    print("COOKIES WIRING TEST PASSED ✔")
+
+
+if __name__ == "__main__":
+    main()

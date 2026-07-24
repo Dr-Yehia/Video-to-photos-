@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from .downloader import download_video
+from .downloader import download_video, measure_height
 from .extractor import ExtractorConfig, SlideExtractor
 from .pdf_builder import build_pdf, build_zip
 
@@ -48,11 +48,16 @@ class Job:
     local_path: str = ""            # set instead of url for uploaded files
     sensitivity: str = "medium"
     max_height: int = 1080
+    exact_height: bool = False      # insist on max_height exactly
+    source_hint: str = ""           # probe_video()'s 'source', if known
+    cookies_file: str = ""          # optional cookies.txt path
     status: str = "queued"          # queued/downloading/extracting/done/error
     progress: float = 0.0
     message: str = ""
     title: str = ""
     error: str = ""
+    actual_height: int = 0          # measured from the downloaded file
+    attempt_log: List[str] = field(default_factory=list)
     slides: List[dict] = field(default_factory=list)
     workdir: str = ""
     created_at: float = field(default_factory=time.time)
@@ -66,6 +71,7 @@ class Job:
             "message": self.message,
             "title": self.title,
             "error": self.error,
+            "actual_height": self.actual_height,
             "slides": self.slides,
         }
 
@@ -79,10 +85,14 @@ class JobManager:
         os.makedirs(root, exist_ok=True)
 
     def create(self, url: str, sensitivity: str = "medium",
-               max_height: int = 1080) -> Job:
+               max_height: int = 1080, exact_height: bool = False,
+               source_hint: str = "", cookies_file: str = "") -> Job:
         return self._start(Job(id=uuid.uuid4().hex[:12], url=url,
                                sensitivity=sensitivity,
-                               max_height=max_height))
+                               max_height=max_height,
+                               exact_height=exact_height,
+                               source_hint=source_hint,
+                               cookies_file=cookies_file))
 
     def create_from_file(self, local_path: str, title: str,
                          sensitivity: str = "medium") -> Job:
@@ -109,6 +119,11 @@ class JobManager:
             if job.local_path:
                 video_path = job.local_path
                 remove_video = job.local_path.startswith(self.root)
+                ex_base, ex_span = 0.0, 0.95   # no download stage
+                try:
+                    job.actual_height = measure_height(video_path)
+                except Exception:
+                    pass
             else:
                 job.status = "downloading"
                 job.message = "downloading video"
@@ -119,16 +134,22 @@ class JobManager:
 
                 info = download_video(job.url, job.workdir,
                                       max_height=job.max_height,
-                                      progress=dl_progress)
-                job.title = info["title"]
+                                      progress=dl_progress,
+                                      exact_height=job.exact_height,
+                                      source_hint=job.source_hint or None,
+                                      cookies_file=job.cookies_file or None,
+                                      attempt_log=job.attempt_log)
+                job.title = job.title or info["title"]
+                job.actual_height = info.get("actual_height") or 0
                 video_path = info["path"]
                 remove_video = True
+                ex_base, ex_span = 0.4, 0.55
 
             job.status = "extracting"
             job.message = "extracting slides"
 
             def ex_progress(p, msg):
-                job.progress = 0.4 + p * 0.55  # extraction = next 55%
+                job.progress = ex_base + p * ex_span
                 job.message = msg
 
             extractor = SlideExtractor(

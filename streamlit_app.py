@@ -4,9 +4,12 @@ Run locally:
     pip install -r requirements.txt
     streamlit run streamlit_app.py
 
-Flow for URLs: the video is PROBED first (title, duration and the list
-of qualities that actually exist in it), the user picks one of the real
-qualities, then extraction runs. Nothing is assumed about the video.
+Architecture note: conversions run as BACKGROUND JOBS on the server
+(slide_extractor.jobs.JobManager), decoupled from the browser session.
+The job id is stored in the page URL (?job=...), so a dropped
+websocket, a phone screen turning off, or even closing the tab does NOT
+lose the work — reopening the same URL shows live progress or the
+finished results. This is essential for hours-long videos.
 """
 
 import os
@@ -14,17 +17,16 @@ import tempfile
 
 import streamlit as st
 
-from slide_extractor import (ExtractorConfig, SlideExtractor, __version__,
-                             build_pdf, build_zip, download_video,
-                             probe_video)
+from slide_extractor import __version__, build_pdf, probe_video
+from slide_extractor.jobs import JobManager
 from slide_extractor.pot_server import ensure_pot_server
+
+st.set_page_config(page_title="فيديو إلى شرائح — Video to Slides",
+                   page_icon="🎬", layout="wide")
 
 # Start the PO-token server (unlocks >360p qualities); runs npm install
 # in the background on the very first boot, no-op afterwards.
 ensure_pot_server()
-
-st.set_page_config(page_title="فيديو إلى شرائح — Video to Slides",
-                   page_icon="🎬", layout="wide")
 
 # Allow configuring a download proxy and custom mirror instances via
 # Streamlit Cloud secrets (e.g. your own cobalt/Invidious server).
@@ -35,6 +37,14 @@ try:
             os.environ[_key] = st.secrets[_key]
 except Exception:
     pass  # no secrets file configured
+
+
+@st.cache_resource
+def get_manager() -> JobManager:
+    return JobManager(root=os.environ.get("OUTPUT_DIR", "output"))
+
+
+manager = get_manager()
 
 # RTL support for the Arabic interface
 st.markdown(
@@ -61,9 +71,14 @@ SENSITIVITY_LABELS = {
     "عالية — يلتقط تغييرات أدق": "high",
 }
 
+STATUS_AR = {
+    "queued": "في الانتظار…",
+    "downloading": "⬇️ جارٍ تحميل الفيديو…",
+    "extracting": "🔍 جارٍ التحليل واستخراج الشرائح…",
+}
 
-def show_download_error(exc: Exception, attempt_log=None):
-    msg = str(exc)
+
+def show_download_error(msg: str, attempt_log=None):
     low = msg.lower()
     if "drm" in low:
         st.error(
@@ -97,211 +112,99 @@ def show_download_error(exc: Exception, attempt_log=None):
             st.code("\n".join(attempt_log))
 
 
-def run_pipeline(video_path: str, sensitivity: str, workdir: str,
-                 title: str) -> dict:
-    """Extract slides then build PDF + ZIP; returns result paths."""
-    bar = st.progress(0.0, text="🔍 جارٍ تحليل الفيديو واستخراج الشرائح…")
-
-    def on_progress(p, msg):
-        bar.progress(min(p, 1.0), text=f"🔍 جارٍ التحليل… {p * 100:.0f}%")
-
-    extractor = SlideExtractor(ExtractorConfig.from_sensitivity(sensitivity))
-    slides_dir = os.path.join(workdir, "slides")
-    slides = extractor.extract(video_path, slides_dir, progress=on_progress)
-    if not slides:
-        raise RuntimeError("لم يتم العثور على شرائح — جرّب دقة استخراج أعلى.")
-
-    bar.progress(1.0, text="📄 جارٍ بناء ملف الـ PDF…")
-    paths = [s.path for s in slides]
-    pdf = build_pdf(paths, os.path.join(workdir, "slides.pdf"))
-    zipf = build_zip(paths, os.path.join(workdir, "slides.zip"))
-    bar.empty()
-    return {
-        "title": title,
-        "workdir": workdir,
-        "slides": [{"index": s.index, "timestamp": s.timestamp,
-                    "path": s.path} for s in slides],
-        "pdf": pdf,
-        "zip": zipf,
-    }
-
-
-def save_cookies(upload, workdir: str):
+def save_cookies(upload, dest_dir: str):
     if upload is None:
-        return None
-    path = os.path.join(workdir, "cookies.txt")
+        return ""
+    os.makedirs(dest_dir, exist_ok=True)
+    path = os.path.join(dest_dir, "cookies.txt")
     with open(path, "wb") as f:
         f.write(upload.getbuffer())
     return path
 
 
-sens_label = st.selectbox("دقة الاستخراج", list(SENSITIVITY_LABELS), index=1)
-sensitivity = SENSITIVITY_LABELS[sens_label]
+def start_job_and_go(job):
+    st.query_params["job"] = job.id
+    st.rerun()
 
-tab_url, tab_file = st.tabs(["🔗 رابط يوتيوب", "📁 رفع ملف من جهازك"])
 
-# ---------------------------------------------------------------- URL tab
-with tab_url:
-    url = st.text_input("رابط الفيديو",
-                        placeholder="https://www.youtube.com/watch?v=...")
-    with st.expander("⚙️ خيارات متقدمة — إذا رفض يوتيوب التحميل من الخادم"):
-        st.markdown(
-            "يوتيوب يحجب التحميل من خوادم السحابة، ويطلب حرفياً تسجيل "
-            "الدخول (*Sign in to confirm you're not a bot*). التطبيق يجرّب "
-            "تلقائياً عدة عملاء، ثم خدمة **Cobalt** (محرك مواقع التحميل "
-            "الكبيرة — يجلب الفيديو بدون صوت بخوادمه هو)، ثم شبكات المرايا "
-            "الحية — وإذا استمر الرفض فالحل الحاسم هو ملف `cookies.txt`:\n\n"
-            "**خطوات الحصول عليه (من كمبيوتر):**\n"
-            "1. ثبّت إضافة **Get cookies.txt LOCALLY** في متصفح كروم.\n"
-            "2. افتح `youtube.com` وسجّل دخولك بحسابك.\n"
-            "3. اضغط أيقونة الإضافة ← **Export** — سيُحفظ ملف "
-            "`cookies.txt`.\n"
-            "4. ارفعه هنا، ثم أعد الفحص والاستخراج.\n\n"
-            "بديل أقوى للاستخدام الدائم: بروكسي سكني في إعدادات التطبيق "
-            "(Secrets): `YTDLP_PROXY = \"http://user:pass@host:port\"`."
-        )
-        cookies_upload = st.file_uploader("ملف cookies.txt (اختياري)",
-                                          type=["txt"])
+# ======================================================================
+# JOB VIEW — rendered when the URL carries ?job=...; survives reconnects
+# ======================================================================
+def render_job(job):
+    top = st.container()
+    with top:
+        if st.button("🆕 بدء تحويل جديد", use_container_width=False):
+            st.query_params.clear()
+            st.rerun()
 
-    if st.button("🔍 فحص الفيديو ومعرفة الجودات المتاحة",
-                 use_container_width=True):
-        if not url.strip():
-            st.error("أدخل رابط الفيديو أولاً.")
-        else:
-            st.session_state.pop("result", None)
-            st.session_state.pop("probe", None)
-            try:
-                workdir = tempfile.mkdtemp(prefix="v2s_")
-                cookies_path = save_cookies(cookies_upload, workdir)
-                with st.spinner("جارٍ قراءة معلومات الفيديو وجوداته الحقيقية…"):
-                    probe = probe_video(url.strip(),
-                                        cookies_file=cookies_path)
-                st.session_state["probe"] = probe
-                st.session_state["probe_url"] = url.strip()
-                st.session_state["probe_workdir"] = workdir
-                st.session_state["probe_cookies"] = cookies_path
-            except Exception as exc:
-                show_download_error(exc)
+    if job.status in ("queued", "downloading", "extracting"):
+        st.info("⏳ التحويل يعمل على الخادم في الخلفية — **يمكنك إغلاق "
+                "الصفحة والعودة لاحقاً بنفس الرابط**، لن يضيع عملك.")
 
-    probe = st.session_state.get("probe")
-    if probe and st.session_state.get("probe_url") == url.strip():
-        mins, secs = divmod(int(probe["duration"] or 0), 60)
-        dur = f"{mins}:{secs:02d}" if probe["duration"] else "غير معروفة"
-        st.success(f"🎥 **{probe['title']}** — المدة: {dur}")
+        @st.fragment(run_every="2s")
+        def poll():
+            j = manager.get(job.id)
+            if j is None:
+                st.error("المهمة لم تعد موجودة (أعيد تشغيل الخادم؟)")
+                return
+            if j.status in ("done", "error"):
+                st.rerun(scope="app")
+            label = STATUS_AR.get(j.status, j.status)
+            detail = f" ({j.message})" if j.message and "MB" in j.message \
+                else (f" — {j.message}" if j.message else "")
+            st.progress(min(max(j.progress, 0.0), 1.0),
+                        text=f"{label} {j.progress * 100:.0f}%{detail}")
+            if j.title:
+                st.caption(f"🎥 {j.title}")
 
-        if probe["heights"]:
-            labels = [f"{h}p" for h in probe["heights"]]
-            st.markdown("**الجودات المتاحة فعلياً في هذا الفيديو:** "
-                        + " · ".join(labels))
-            choice = st.selectbox("اختر الجودة", labels, index=0)
-            chosen_height = int(choice.rstrip("p"))
-            exact = True
-        else:
-            st.info("تعذرت قراءة قائمة الجودات — سيتم تحميل أفضل جودة "
-                    "متاحة تلقائياً.")
-            chosen_height = 4320  # i.e. no cap: best the video offers
-            exact = False
+        poll()
+        return
 
-        if st.button("🚀 استخراج الشرائح", type="primary",
-                     use_container_width=True):
-            st.session_state.pop("result", None)
-            attempt_log = []
-            try:
-                workdir = st.session_state["probe_workdir"]
-                bar = st.progress(0.0, text="⬇️ جارٍ تحميل الفيديو…")
+    if job.status == "error":
+        show_download_error(job.error, job.attempt_log)
+        return
 
-                def dl_progress(p, msg):
-                    label = ("⬇️ جارٍ التحميل عبر المرايا… "
-                             if "mirror" in msg else "⬇️ جارٍ التحميل… ")
-                    detail = f" ({msg})" if "MB" in msg else ""
-                    bar.progress(min(p, 1.0),
-                                 text=f"{label}{p * 100:.0f}%{detail}")
+    # ----- done -----
+    quality_note = (f" — الجودة الفعلية: {job.actual_height}p"
+                    if job.actual_height else "")
+    st.success(f"✅ تم استخراج {len(job.slides)} شريحة من: "
+               f"{job.title or 'الفيديو'}{quality_note}")
+    if (job.exact_height and job.actual_height
+            and job.actual_height != job.max_height):
+        st.warning(
+            f"⚠️ طلبت {job.max_height}p لكن كل القنوات المتاحة رفضت هذه "
+            f"الجودة، فتم التحميل بأفضل جودة ممكنة: **{job.actual_height}p** "
+            f"(مقاسة من الملف نفسه).")
+        with st.expander("سجل المحاولات"):
+            st.code("\n".join(job.attempt_log) or "(فارغ)")
 
-                info = download_video(
-                    url.strip(), workdir, max_height=chosen_height,
-                    progress=dl_progress, exact_height=exact,
-                    source_hint=probe.get("source"),
-                    attempt_log=attempt_log,
-                    cookies_file=st.session_state.get("probe_cookies"))
-                bar.empty()
-
-                actual = info.get("actual_height") or 0
-                if exact and actual and actual != chosen_height:
-                    st.warning(
-                        f"⚠️ طلبت {chosen_height}p لكن كل القنوات المتاحة "
-                        f"رفضت هذه الجودة، فتم التحميل بأفضل جودة ممكنة: "
-                        f"**{actual}p** (مقاسة من الملف نفسه).")
-                    with st.expander("سجل المحاولات — لماذا لم تنجح "
-                                     f"{chosen_height}p؟"):
-                        st.code("\n".join(attempt_log) or "(فارغ)")
-
-                title = (probe.get("title")
-                         if probe.get("title") not in (None, "", "video")
-                         else info["title"])
-                result = run_pipeline(
-                    info["path"], sensitivity, workdir, title)
-                result["actual_height"] = actual
-                st.session_state["result"] = result
-            except Exception as exc:
-                show_download_error(exc, attempt_log)
-
-# --------------------------------------------------------------- File tab
-with tab_file:
-    uploaded = st.file_uploader(
-        "ملف الفيديو (بدون حد عملي للحجم — حتى 4GB)",
-        type=["mp4", "webm", "mkv", "avi", "mov"])
-    if uploaded is not None and st.button("🚀 استخراج الشرائح من الملف",
-                                          type="primary",
-                                          use_container_width=True):
-        st.session_state.pop("result", None)
-        try:
-            workdir = tempfile.mkdtemp(prefix="v2s_")
-            video_path = os.path.join(workdir, uploaded.name)
-            # Chunked copy: a movie-sized upload must not be duplicated
-            # in RAM on small cloud containers.
-            import shutil as _shutil
-            uploaded.seek(0)
-            with open(video_path, "wb") as f:
-                _shutil.copyfileobj(uploaded, f, length=4 << 20)
-            title = os.path.splitext(uploaded.name)[0]
-            st.session_state["result"] = run_pipeline(
-                video_path, sensitivity, workdir, title)
-        except Exception as exc:
-            show_download_error(exc)
-
-# ----------------------------------------------------------------- Results
-result = st.session_state.get("result")
-if result:
-    slides = result["slides"]
-    quality_note = (f" — الجودة الفعلية: {result['actual_height']}p"
-                    if result.get("actual_height") else "")
-    st.success(f"✅ تم استخراج {len(slides)} شريحة من: "
-               f"{result['title']}{quality_note}")
-
+    slides_dir = os.path.join(job.workdir, "slides")
     st.markdown("### الشرائح المستخرجة — ألغِ تحديد ما لا تريده في الـ PDF")
     cols_per_row = 4
-    for row_start in range(0, len(slides), cols_per_row):
+    for row_start in range(0, len(job.slides), cols_per_row):
         cols = st.columns(cols_per_row)
-        for col, s in zip(cols, slides[row_start:row_start + cols_per_row]):
+        for col, s in zip(cols, job.slides[row_start:row_start + cols_per_row]):
             with col:
-                st.image(s["path"], use_container_width=True)
+                img_path = os.path.join(slides_dir, s["file"])
+                if os.path.isfile(img_path):
+                    st.image(img_path, use_container_width=True)
                 mins, secs = divmod(int(s["timestamp"]), 60)
                 st.checkbox(f"شريحة {s['index'] + 1} — ⏱ {mins}:{secs:02d}",
-                            value=True, key=f"keep_{s['index']}")
+                            value=True, key=f"keep_{job.id}_{s['index']}")
 
-    selected = [s for s in slides
-                if st.session_state.get(f"keep_{s['index']}", True)]
+    selected = [s for s in job.slides
+                if st.session_state.get(f"keep_{job.id}_{s['index']}", True)]
 
     c1, c2 = st.columns(2)
     with c1:
-        if len(selected) == len(slides):
-            pdf_path = result["pdf"]
+        pdf_path = None
+        if len(selected) == len(job.slides):
+            pdf_path = os.path.join(job.workdir, "slides.pdf")
         elif selected:
-            pdf_path = os.path.join(result["workdir"], "slides_custom.pdf")
-            build_pdf([s["path"] for s in selected], pdf_path)
-        else:
-            pdf_path = None
-        if pdf_path:
+            pdf_path = os.path.join(job.workdir, "slides_custom.pdf")
+            build_pdf([os.path.join(slides_dir, s["file"]) for s in selected],
+                      pdf_path)
+        if pdf_path and os.path.isfile(pdf_path):
             with open(pdf_path, "rb") as f:
                 st.download_button(
                     f"⬇️ تحميل PDF ({len(selected)} شريحة)", f,
@@ -310,10 +213,133 @@ if result:
         else:
             st.warning("اختر شريحة واحدة على الأقل.")
     with c2:
-        with open(result["zip"], "rb") as f:
-            st.download_button("⬇️ تحميل كل الصور ZIP", f,
-                               file_name="slides.zip", mime="application/zip",
-                               use_container_width=True)
+        zip_path = os.path.join(job.workdir, "slides.zip")
+        if os.path.isfile(zip_path):
+            with open(zip_path, "rb") as f:
+                st.download_button("⬇️ تحميل كل الصور ZIP", f,
+                                   file_name="slides.zip",
+                                   mime="application/zip",
+                                   use_container_width=True)
+
+
+# ======================================================================
+# INPUT VIEW — no active job in the URL
+# ======================================================================
+def render_inputs():
+    sens_label = st.selectbox("دقة الاستخراج", list(SENSITIVITY_LABELS),
+                              index=1)
+    sensitivity = SENSITIVITY_LABELS[sens_label]
+
+    tab_url, tab_file = st.tabs(["🔗 رابط يوتيوب", "📁 رفع ملف من جهازك"])
+
+    # ---------------------------------------------------------- URL tab
+    with tab_url:
+        url = st.text_input("رابط الفيديو",
+                            placeholder="https://www.youtube.com/watch?v=...")
+        with st.expander("⚙️ خيارات متقدمة — إذا رفض يوتيوب التحميل من الخادم"):
+            st.markdown(
+                "يوتيوب يحجب التحميل من خوادم السحابة، ويطلب حرفياً تسجيل "
+                "الدخول (*Sign in to confirm you're not a bot*). التطبيق "
+                "يجرّب تلقائياً عدة عملاء، ثم خدمة **Cobalt**، ثم شبكات "
+                "المرايا الحية — وإذا استمر الرفض فالحل الحاسم هو ملف "
+                "`cookies.txt`:\n\n"
+                "**خطوات الحصول عليه (من كمبيوتر):**\n"
+                "1. ثبّت إضافة **Get cookies.txt LOCALLY** في متصفح كروم.\n"
+                "2. افتح `youtube.com` وسجّل دخولك بحسابك.\n"
+                "3. اضغط أيقونة الإضافة ← **Export** — سيُحفظ ملف "
+                "`cookies.txt`.\n"
+                "4. ارفعه هنا، ثم أعد الفحص والاستخراج.\n\n"
+                "بديل أقوى للاستخدام الدائم: بروكسي سكني في إعدادات التطبيق "
+                "(Secrets): `YTDLP_PROXY = \"http://user:pass@host:port\"`."
+            )
+            cookies_upload = st.file_uploader("ملف cookies.txt (اختياري)",
+                                              type=["txt"])
+
+        if st.button("🔍 فحص الفيديو ومعرفة الجودات المتاحة",
+                     use_container_width=True):
+            if not url.strip():
+                st.error("أدخل رابط الفيديو أولاً.")
+            else:
+                st.session_state.pop("probe", None)
+                try:
+                    workdir = tempfile.mkdtemp(prefix="v2s_probe_")
+                    cookies_path = save_cookies(cookies_upload, workdir)
+                    with st.spinner("جارٍ قراءة معلومات الفيديو وجوداته "
+                                    "الحقيقية…"):
+                        probe = probe_video(url.strip(),
+                                            cookies_file=cookies_path or None)
+                    st.session_state["probe"] = probe
+                    st.session_state["probe_url"] = url.strip()
+                    st.session_state["probe_cookies"] = cookies_path
+                except Exception as exc:
+                    show_download_error(str(exc))
+
+        probe = st.session_state.get("probe")
+        if probe and st.session_state.get("probe_url") == url.strip():
+            mins, secs = divmod(int(probe["duration"] or 0), 60)
+            dur = f"{mins}:{secs:02d}" if probe["duration"] else "غير معروفة"
+            st.success(f"🎥 **{probe['title']}** — المدة: {dur}")
+
+            if probe["heights"]:
+                labels = [f"{h}p" for h in probe["heights"]]
+                st.markdown("**الجودات المتاحة فعلياً في هذا الفيديو:** "
+                            + " · ".join(labels))
+                choice = st.selectbox("اختر الجودة", labels, index=0)
+                chosen_height = int(choice.rstrip("p"))
+                exact = True
+            else:
+                st.info("تعذرت قراءة قائمة الجودات — سيتم تحميل أفضل جودة "
+                        "متاحة تلقائياً.")
+                chosen_height = 4320
+                exact = False
+
+            if st.button("🚀 استخراج الشرائح", type="primary",
+                         use_container_width=True):
+                job = manager.create(
+                    url.strip(), sensitivity=sensitivity,
+                    max_height=chosen_height, exact_height=exact,
+                    source_hint=probe.get("source") or "",
+                    cookies_file=st.session_state.get("probe_cookies") or "")
+                job.title = probe.get("title") or ""
+                start_job_and_go(job)
+
+    # --------------------------------------------------------- File tab
+    with tab_file:
+        uploaded = st.file_uploader(
+            "ملف الفيديو (بدون حد عملي للحجم — حتى 4GB)",
+            type=["mp4", "webm", "mkv", "avi", "mov"])
+        if uploaded is not None and st.button("🚀 استخراج الشرائح من الملف",
+                                              type="primary",
+                                              use_container_width=True):
+            uploads = os.path.join(manager.root, "uploads")
+            os.makedirs(uploads, exist_ok=True)
+            video_path = os.path.join(
+                uploads, f"{os.urandom(6).hex()}_{uploaded.name}")
+            # Chunked copy: a movie-sized upload must not be duplicated
+            # in RAM on small cloud containers.
+            import shutil as _shutil
+            uploaded.seek(0)
+            with open(video_path, "wb") as f:
+                _shutil.copyfileobj(uploaded, f, length=4 << 20)
+            title = os.path.splitext(uploaded.name)[0]
+            job = manager.create_from_file(video_path, title=title,
+                                           sensitivity=sensitivity)
+            start_job_and_go(job)
+
+
+# ======================================================================
+job_id = st.query_params.get("job")
+active_job = manager.get(job_id) if job_id else None
+if job_id and active_job is None:
+    st.warning("انتهت صلاحية هذه المهمة (أعيد تشغيل الخادم أو حُذفت لقدمها). "
+               "ابدأ تحويلاً جديداً.")
+    if st.button("موافق"):
+        st.query_params.clear()
+        st.rerun()
+elif active_job is not None:
+    render_job(active_job)
+else:
+    render_inputs()
 
 st.divider()
 st.caption(f"الإصدار {__version__} — مبني بمكتبات مفتوحة المصدر: yt-dlp · "

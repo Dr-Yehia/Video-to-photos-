@@ -9,3 +9,6 @@ slides_output/
 venv/
 nohup.out
 vendor/pot-server/node_modules/
+# Never commit authentication material
+cookies.txt
+*cookies*.txt
