@@ -326,6 +326,15 @@ def render_inputs():
             else:
                 st.info("تعذرت قراءة قائمة الجودات — سيتم تحميل أفضل جودة "
                         "متاحة تلقائياً.")
+                diag = probe.get("diagnostics") or []
+                fmts = probe.get("formats_count")
+                if diag or fmts is not None:
+                    with st.expander("لماذا لم تظهر الجودات؟ (تفاصيل تقنية)"):
+                        if fmts is not None:
+                            st.write(f"عدد الصيغ التي أعادها يوتيوب: "
+                                     f"**{fmts}** — صالحة للفيديو: **0**")
+                        if diag:
+                            st.code("\n".join(diag[-25:]))
                 chosen_height = 4320
                 exact = False
 

@@ -26,10 +26,70 @@ import yt_dlp
 
 ProgressFn = Callable[[float, str], None]
 
-# Tried in order; None = yt-dlp's default client mix. The embedded
-# clients sometimes bypass bot checks that stop the regular ones.
-_CLIENT_ATTEMPTS = (None, ["web_safari"], ["web_embedded"], ["tv_embedded"],
-                    ["tv"], ["ios"], ["mweb"])
+# Tried in order; None = yt-dlp's default client mix.
+#
+# The first entry asks yt-dlp for SEVERAL clients at once: it merges
+# their format lists, so a single attempt covers the union of what any
+# of them offers. That matters because YouTube now forces SABR
+# streaming on some clients — those return formats with no URL, which
+# yt-dlp skips, leaving "Requested format is not available" even for a
+# perfectly authenticated session. tv_simply and android_vr are the
+# clients that still hand out plain URLs most reliably.
+_CLIENT_ATTEMPTS = (
+    ["tv_simply", "android_vr", "tv", "web_safari", "mweb", "default"],
+    None,
+    ["tv_simply"],
+    ["android_vr"],
+    ["tv"],
+    ["tv_downgraded"],
+    ["web_safari"],
+    ["ios"],
+    ["mweb"],
+)
+
+# Include formats that lack a PO token instead of dropping them: they
+# often still download, and dropping them is a common cause of an empty
+# format list.
+_FORMATS_ARG = ["missing_pot"]
+
+
+class _WarningCollector:
+    """Captures yt-dlp's own warnings. They are the ONLY place that
+    explains an empty format list ("... missing a url", "forcing SABR",
+    "PO token"), and suppressing them turned a diagnosable failure into
+    a blank 'Requested format is not available'."""
+
+    INTERESTING = ("sabr", "po token", "pot ", "missing a url", "skipped",
+                   "sign in", "cookie", "throttl", "player response",
+                   "not available", "format")
+
+    def __init__(self, sink: Optional[list], tag: str):
+        self.sink = sink
+        self.tag = tag
+        self._seen = set()
+
+    def _note(self, msg: str):
+        text = " ".join(str(msg).split())
+        low = text.lower()
+        if not any(k in low for k in self.INTERESTING):
+            return
+        key = text[:80]
+        if key in self._seen:
+            return
+        self._seen.add(key)
+        _log(self.sink, f"    ⚠ {self.tag}: {text[:200]}")
+
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        self._note(msg)
+
+    def error(self, msg):
+        pass
 
 # Failures that are specific to the requesting IP/client and therefore
 # worth retrying with another client or another network path. "drm" is
@@ -236,13 +296,17 @@ def _ytdlp_download(url: str, output_dir: str, max_height: int,
     for strategy in strategies:
         for clients in client_attempts:
             opts = {**base_opts, **strategy}
+            yt_args = {"formats": _FORMATS_ARG}
             if clients:
-                opts["extractor_args"] = {"youtube": {"player_client": clients}}
+                yt_args["player_client"] = clients
+            opts["extractor_args"] = {"youtube": yt_args}
+            tag = ",".join(clients) if clients else "default"
+            opts["logger"] = _WarningCollector(log, tag)
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=True)
                     path = ydl.prepare_filename(info)
-                _log(log, f"yt-dlp {clients or 'default'}: downloaded ✓")
+                _log(log, f"yt-dlp [{tag}]: downloaded ✓")
                 return {
                     "path": path,
                     "title": info.get("title") or "video",
@@ -256,7 +320,7 @@ def _ytdlp_download(url: str, output_dir: str, max_height: int,
                 low = str(exc).lower()
                 if "requested format" in low or "no video formats" in low:
                     saw_format_issue = True
-                _log(log, f"yt-dlp {clients or 'default'}: "
+                _log(log, f"yt-dlp [{tag}]: "
                           f"{str(exc).splitlines()[0][:140]}")
                 if _retryable(str(exc)):
                     continue  # another client may be accepted
@@ -604,29 +668,50 @@ def probe_video(url: str, cookies_file: Optional[str] = None) -> dict:
         opts["proxy"] = proxy
 
     first_error: Optional[Exception] = None
+    diagnostics: List[str] = []
+    best: Optional[dict] = None
     for clients in _CLIENT_ATTEMPTS:
         o = dict(opts)
+        yt_args = {"formats": _FORMATS_ARG}
         if clients:
-            o["extractor_args"] = {"youtube": {"player_client": clients}}
+            yt_args["player_client"] = clients
+        o["extractor_args"] = {"youtube": yt_args}
+        tag = ",".join(clients) if clients else "default"
+        o["logger"] = _WarningCollector(diagnostics, tag)
         try:
             with yt_dlp.YoutubeDL(o) as ydl:
                 info = ydl.extract_info(url, download=False)
+            formats = info.get("formats") or []
             heights = sorted({
-                int(f["height"]) for f in info.get("formats", [])
+                int(f["height"]) for f in formats
                 if f.get("height") and f.get("vcodec") not in (None, "none")
                 and not f.get("has_drm")
             }, reverse=True)
-            return {
+            result = {
                 "title": info.get("title") or "video",
                 "duration": info.get("duration") or 0,
                 "heights": heights,
                 "source": "youtube",
+                "formats_count": len(formats),
+                "client": tag,
+                "diagnostics": diagnostics,
             }
+            if heights:
+                return result
+            # Reached YouTube but every format was unusable (SABR /
+            # missing URLs). Keep the metadata and try another client
+            # before giving up on the quality list.
+            diagnostics.append(
+                f"    ⚠ {tag}: reached the video but 0 usable video "
+                f"formats ({len(formats)} raw formats)")
+            best = best or result
         except yt_dlp.utils.DownloadError as exc:
             first_error = first_error or exc
             if _retryable(str(exc)):
                 continue
             raise
+    if best is not None:
+        return best
 
     vid = _video_id(url)
     if vid:
@@ -652,6 +737,7 @@ def probe_video(url: str, cookies_file: Optional[str] = None) -> dict:
                     "title": data.get("title") or "video",
                     "duration": data.get("lengthSeconds") or 0,
                     "heights": heights,
+                    "diagnostics": diagnostics,
                     "source": "invidious",
                 }
             except Exception:
@@ -671,6 +757,7 @@ def probe_video(url: str, cookies_file: Optional[str] = None) -> dict:
                     "title": data.get("title") or "video",
                     "duration": data.get("duration") or 0,
                     "heights": heights,
+                    "diagnostics": diagnostics,
                     "source": "piped",
                 }
             except Exception:

@@ -116,9 +116,90 @@ def check_probe_options():
           "ffmpeg_location ✓")
 
 
+def check_sabr_probe():
+    """The production failure: YouTube answers, but every format is
+    unusable (no URL — SABR streaming), so the quality list came back
+    empty with no explanation. The probe must keep trying other player
+    clients and, when none yields a usable format, still return the
+    metadata plus diagnostics that say why."""
+    calls = []
+
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+            args = opts.get("extractor_args", {}).get("youtube", {})
+            self.clients = args.get("player_client")
+            self.logger = opts.get("logger")
+            calls.append(self.clients)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, url, download=False):
+            if self.logger:
+                self.logger.warning(
+                    "Some tv client https formats have been skipped as "
+                    "they are missing a url. YouTube is forcing SABR "
+                    "streaming for this client.")
+            # Only the tv_simply client hands out a usable format.
+            if self.clients and "tv_simply" in self.clients:
+                return {"title": "T", "duration": 5,
+                        "formats": [{"height": 1080, "vcodec": "avc1"}]}
+            return {"title": "T", "duration": 5,
+                    "formats": [{"height": 1080, "vcodec": "none"}]}
+
+    real = downloader.yt_dlp.YoutubeDL
+    downloader.yt_dlp.YoutubeDL = FakeYDL
+    try:
+        info = downloader.probe_video("https://youtu.be/xxxxxxxxxxx")
+    finally:
+        downloader.yt_dlp.YoutubeDL = real
+
+    print(f"  clients tried: {len(calls)} | heights: {info['heights']}")
+    assert info["heights"] == [1080], info
+    # the combined first round must include tv_simply, so ONE call is
+    # enough to recover the quality list
+    assert len(calls) == 1, calls
+    assert any("SABR" in d for d in info.get("diagnostics", [])), \
+        info.get("diagnostics")
+    print("  SABR warning captured into diagnostics ✓")
+
+    # Now make even tv_simply unusable: the probe must exhaust the
+    # clients and still return metadata + a clear explanation.
+    class AllSabr(FakeYDL):
+        def extract_info(self, url, download=False):
+            if self.logger:
+                self.logger.warning("formats have been skipped as they "
+                                    "are missing a url (SABR)")
+            return {"title": "T", "duration": 5,
+                    "formats": [{"height": 720, "vcodec": "none"}]}
+
+    calls.clear()
+    downloader.yt_dlp.YoutubeDL = AllSabr
+    try:
+        info = downloader.probe_video("https://youtu.be/xxxxxxxxxxx")
+    finally:
+        downloader.yt_dlp.YoutubeDL = real
+    print(f"  all-SABR: clients tried {len(calls)}, heights {info['heights']},"
+          f" formats_count {info.get('formats_count')}")
+    assert info["heights"] == [], info
+    assert info["title"] == "T", info          # metadata still returned
+    assert info["formats_count"] == 1, info
+    assert len(calls) == len(downloader._CLIENT_ATTEMPTS), calls
+    assert any("0 usable video formats" in d
+               for d in info.get("diagnostics", [])), info.get("diagnostics")
+    print("  exhausted every client and explained the empty list ✓")
+
+
 def main():
     print("probe options:")
     check_probe_options()
+
+    print("SABR / empty-format-list handling:")
+    check_sabr_probe()
 
     print("wiring (UI -> JobManager -> download_video):")
     check_wiring()
