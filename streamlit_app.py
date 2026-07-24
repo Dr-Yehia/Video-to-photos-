@@ -13,7 +13,6 @@ finished results. This is essential for hours-long videos.
 """
 
 import os
-import tempfile
 
 import streamlit as st
 
@@ -112,13 +111,50 @@ def show_download_error(msg: str, attempt_log=None):
             st.code("\n".join(attempt_log))
 
 
-def save_cookies(upload, dest_dir: str):
+AUTH_COOKIES = {"SID", "__Secure-1PSID", "__Secure-3PSID", "LOGIN_INFO",
+                "SAPISID"}
+
+
+def save_cookies(upload) -> str:
+    """Persist the uploaded cookies.txt and report what it contains.
+
+    Called on EVERY rerun while a file is attached — not only when a
+    button is pressed — so cookies count no matter when they were
+    uploaded relative to the probe. The file lives under the job root
+    (not a temp dir) so it stays valid for the whole conversion.
+    """
     if upload is None:
         return ""
+    if "session_tag" not in st.session_state:
+        st.session_state["session_tag"] = os.urandom(6).hex()
+    dest_dir = os.path.join(manager.root, "cookies")
     os.makedirs(dest_dir, exist_ok=True)
-    path = os.path.join(dest_dir, "cookies.txt")
+    path = os.path.join(dest_dir,
+                        f"{st.session_state['session_tag']}_cookies.txt")
+    data = upload.getvalue()
     with open(path, "wb") as f:
-        f.write(upload.getbuffer())
+        f.write(data)
+
+    # Immediate feedback: a silently-ignored cookie file was exactly the
+    # failure mode this replaces.
+    try:
+        from yt_dlp.cookies import load_cookies
+        jar = load_cookies(path, None, None)
+        names = {c.name for c in jar if "youtube.com" in c.domain}
+        missing = AUTH_COOKIES - names
+        if missing:
+            st.warning(
+                f"⚠️ الملف مقروء ({len(names)} كوكي ليوتيوب) لكن تنقصه "
+                f"كوكيز تسجيل الدخول: {', '.join(sorted(missing))} — "
+                "تأكد أنك سجّلت دخولك في يوتيوب قبل التصدير.")
+        else:
+            st.success(f"✅ ملف الكوكيز جاهز وسيُستخدم في التحميل "
+                       f"({len(names)} كوكي ليوتيوب، كوكيز تسجيل الدخول "
+                       f"موجودة).")
+    except Exception as exc:
+        st.error(f"⚠️ تعذّرت قراءة ملف الكوكيز — تأكد أنه بصيغة Netscape "
+                 f"من إضافة *Get cookies.txt LOCALLY*. ({exc})")
+        return ""
     return path
 
 
@@ -254,6 +290,9 @@ def render_inputs():
             )
             cookies_upload = st.file_uploader("ملف cookies.txt (اختياري)",
                                               type=["txt"])
+            # Saved on every rerun, so cookies apply whether they were
+            # attached before or after the probe.
+            cookies_path = save_cookies(cookies_upload)
 
         if st.button("🔍 فحص الفيديو ومعرفة الجودات المتاحة",
                      use_container_width=True):
@@ -262,15 +301,12 @@ def render_inputs():
             else:
                 st.session_state.pop("probe", None)
                 try:
-                    workdir = tempfile.mkdtemp(prefix="v2s_probe_")
-                    cookies_path = save_cookies(cookies_upload, workdir)
                     with st.spinner("جارٍ قراءة معلومات الفيديو وجوداته "
                                     "الحقيقية…"):
                         probe = probe_video(url.strip(),
                                             cookies_file=cookies_path or None)
                     st.session_state["probe"] = probe
                     st.session_state["probe_url"] = url.strip()
-                    st.session_state["probe_cookies"] = cookies_path
                 except Exception as exc:
                     show_download_error(str(exc))
 
@@ -293,13 +329,15 @@ def render_inputs():
                 chosen_height = 4320
                 exact = False
 
+            if cookies_path:
+                st.caption("🍪 سيتم استخدام ملف الكوكيز في هذا التحويل.")
             if st.button("🚀 استخراج الشرائح", type="primary",
                          use_container_width=True):
                 job = manager.create(
                     url.strip(), sensitivity=sensitivity,
                     max_height=chosen_height, exact_height=exact,
                     source_hint=probe.get("source") or "",
-                    cookies_file=st.session_state.get("probe_cookies") or "")
+                    cookies_file=cookies_path)
                 job.title = probe.get("title") or ""
                 start_job_and_go(job)
 

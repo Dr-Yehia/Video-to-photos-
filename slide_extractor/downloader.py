@@ -585,7 +585,18 @@ def probe_video(url: str, cookies_file: Optional[str] = None) -> dict:
         "no_warnings": True,
         "noplaylist": True,
         "socket_timeout": 20,
+        "skip_download": True,
+        # A probe only needs metadata. Without these, yt-dlp still runs
+        # its default format selection and aborts the whole probe with
+        # "Requested format is not available" whenever the default
+        # selector can't be satisfied — hiding the format list we came
+        # for. ffmpeg_location matters because the default selector
+        # wants to merge video+audio.
+        "ignore_no_formats_error": True,
     }
+    ffmpeg = _ffmpeg_location()
+    if ffmpeg:
+        opts["ffmpeg_location"] = os.path.dirname(ffmpeg)
     if cookies_file and os.path.isfile(cookies_file):
         opts["cookiefile"] = cookies_file
     proxy = os.environ.get("YTDLP_PROXY")

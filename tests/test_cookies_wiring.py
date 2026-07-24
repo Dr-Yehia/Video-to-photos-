@@ -71,7 +71,55 @@ def check_wiring():
     assert captured.get("attempt_log") is not None, captured
 
 
+def check_probe_options():
+    """probe_video must (a) attach the cookie file, (b) not let yt-dlp's
+    default format selection abort a metadata-only probe, and (c) know
+    where ffmpeg is — the missing pieces that made a probe WITH cookies
+    fail with 'Requested format is not available'."""
+    captured = {}
+
+    class FakeYDL:
+        def __init__(self, opts):
+            captured.update(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {"title": "T", "duration": 1,
+                    "formats": [{"height": 1080, "vcodec": "avc1"},
+                                {"height": 360, "vcodec": "avc1"}]}
+
+    real = downloader.yt_dlp.YoutubeDL
+    downloader.yt_dlp.YoutubeDL = FakeYDL
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".txt",
+                                         delete=False) as f:
+            f.write("# Netscape HTTP Cookie File\n")
+            cookie_path = f.name
+        info = downloader.probe_video("https://youtu.be/xxxxxxxxxxx",
+                                      cookies_file=cookie_path)
+    finally:
+        downloader.yt_dlp.YoutubeDL = real
+        os.unlink(cookie_path)
+
+    print(f"  heights read: {info['heights']}")
+    assert info["heights"] == [1080, 360], info
+    assert captured.get("cookiefile") == cookie_path, captured
+    assert captured.get("ignore_no_formats_error") is True, captured
+    assert captured.get("skip_download") is True, captured
+    assert "ffmpeg_location" in captured, captured
+    print("  probe options: cookiefile ✓ ignore_no_formats_error ✓ "
+          "ffmpeg_location ✓")
+
+
 def main():
+    print("probe options:")
+    check_probe_options()
+
     print("wiring (UI -> JobManager -> download_video):")
     check_wiring()
 
