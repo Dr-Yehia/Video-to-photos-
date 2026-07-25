@@ -19,14 +19,16 @@ import streamlit as st
 from slide_extractor import __version__, build_pdf, probe_video
 from slide_extractor.downloader import js_runtime_status
 from slide_extractor.jobs import JobManager
-from slide_extractor.pot_server import ensure_pot_server
 
 st.set_page_config(page_title="فيديو إلى شرائح — Video to Slides",
                    page_icon="🎬", layout="wide")
 
 # Start the PO-token server (unlocks >360p qualities); runs npm install
 # in the background on the very first boot, no-op afterwards.
-ensure_pot_server()
+# NOTE: the PO-token server (Node) and the JS runtime download are NOT
+# started here. They are only needed for YouTube URLs, and running them
+# on every app start burns CPU on free hosting — which is exactly what
+# gets an app throttled. They are started lazily by the download path.
 
 # Allow configuring a download proxy and custom mirror instances via
 # Streamlit Cloud secrets (e.g. your own cobalt/Invidious server).

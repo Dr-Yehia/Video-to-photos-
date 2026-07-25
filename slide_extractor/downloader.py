@@ -57,8 +57,21 @@ _FORMATS_ARG = ["missing_pot"]
 _REMOTE_COMPONENTS = ["ejs:npm", "ejs:github"]
 
 
+def _ensure_youtube_helpers() -> None:
+    """Start the helpers YouTube needs — and ONLY when a YouTube request
+    is actually happening. Uploaded files never touch this, so free
+    hosting is not billed CPU for a Node server and a runtime download
+    that nobody asked for."""
+    try:
+        from .pot_server import ensure_pot_server
+        ensure_pot_server()
+    except Exception:
+        pass
+
+
 def _js_opts() -> dict:
     """yt-dlp options that make ciphered YouTube formats decodable."""
+    _ensure_youtube_helpers()
     from .jsruntime import js_runtimes
     runtimes, _status = js_runtimes()
     if not runtimes:
